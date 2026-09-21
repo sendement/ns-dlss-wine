@@ -1,0 +1,63 @@
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 92576fa..39e38ac 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -6721,6 +6721,33 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
+         return vr ? E_FAIL : S_OK;
+     }
+ 
++    /* NS-DLSS patch: shared HEAPS (used by the DLSS-G bridge to alias one buffer between D3D12 and CUDA).
++     * The heap's memory is allocated exportable (see vkd3d_allocate_heap_memory), so hand out its opaque handle. */
++    {
++        ID3D12Heap1 *heap_iface;
++        if (SUCCEEDED(ID3D12DeviceChild_QueryInterface(object, &IID_ID3D12Heap1, (void**)&heap_iface)))
++        {
++            struct d3d12_heap *heap = impl_from_ID3D12Heap1(heap_iface);
++            VkMemoryGetWin32HandleInfoKHR heap_handle_info;
++            VkResult heap_vr;
++
++            if (!(heap->desc.Flags & D3D12_HEAP_FLAG_SHARED) || !heap->allocation.device_allocation.vk_memory)
++            {
++                ID3D12Heap1_Release(heap_iface);
++                return DXGI_ERROR_INVALID_CALL;
++            }
++            heap_handle_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
++            heap_handle_info.pNext = NULL;
++            heap_handle_info.memory = heap->allocation.device_allocation.vk_memory;
++            heap_handle_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++            heap_vr = VK_CALL(vkGetMemoryWin32HandleKHR(device->vk_device, &heap_handle_info, handle));
++            if (heap_vr)
++                ERR("NS-DLSS: vkGetMemoryWin32HandleKHR for a shared heap failed, vr %d.\n", heap_vr);
++            ID3D12Heap1_Release(heap_iface);
++            return heap_vr ? E_FAIL : S_OK;
++        }
++    }
++
+     if (SUCCEEDED(ID3D12DeviceChild_QueryInterface(object, &IID_ID3D12Fence, (void**)&fence_iface)))
+     {
+         VkSemaphoreGetWin32HandleInfoKHR win32_handle_info;
+diff --git a/libs/vkd3d/memory.c b/libs/vkd3d/memory.c
+index 187f0fd..c6a1337 100644
+--- a/libs/vkd3d/memory.c
++++ b/libs/vkd3d/memory.c
+@@ -2296,6 +2296,20 @@ HRESULT vkd3d_allocate_heap_memory(struct d3d12_device *device, struct vkd3d_mem
+         }
+     }
+ 
++#ifdef _WIN32
++    /* NS-DLSS patch: D3D12_HEAP_FLAG_SHARED heaps get their own exportable VkDeviceMemory (a pNext chain also makes
++     * vkd3d skip suballocation) so CreateSharedHandle() can give out an opaque handle for CUDA interop. */
++    VkExportMemoryAllocateInfo shared_heap_export;
++    if ((info->heap_desc.Flags & D3D12_HEAP_FLAG_SHARED) && !(info->heap_desc.Flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER)
++            && !alloc_info.host_ptr && !alloc_info.pNext)
++    {
++        memset(&shared_heap_export, 0, sizeof(shared_heap_export));
++        shared_heap_export.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
++        shared_heap_export.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++        alloc_info.pNext = &shared_heap_export;
++    }
++#endif
++
+     hr = vkd3d_allocate_memory(device, allocator, &alloc_info, allocation);
+ 
+     if (SUCCEEDED(hr) && VKD3D_CONFIG_FLAG_IS_SET(DEBUG_UTILS) && !allocation->chunk)

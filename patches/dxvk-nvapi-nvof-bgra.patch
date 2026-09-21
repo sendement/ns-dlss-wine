@@ -1,0 +1,30 @@
+diff --git a/src/nvofapi_d3d12.cpp b/src/nvofapi_d3d12.cpp
+index 37cb42d..3fed482 100644
+--- a/src/nvofapi_d3d12.cpp
++++ b/src/nvofapi_d3d12.cpp
+@@ -70,7 +70,9 @@ NVOFAPI_FUNCTION GetSurfaceFormatCountD3D12(NvOFHandle hOf, const NV_OF_BUFFER_U
+     if (log::tracing())
+         log::trace(n, log::fmt::hnd(hOf), bufferUsage, ofMode, log::fmt::ptr(pCount));
+ 
+-    *pCount = 1;
++    // NS-DLSS patch: the DLSS-G bridge insists that the INPUT list contains B8G8R8A8_UNORM (ABGR8 in NVOF terms),
++    // which the Vulkan optical-flow session created in NvOFInstance::Initialize() supports.
++    *pCount = bufferUsage == NV_OF_BUFFER_USAGE_INPUT ? 3 : 1;
+     return Success(n);
+ }
+ 
+@@ -80,9 +82,11 @@ NVOFAPI_FUNCTION GetSurfaceFormatD3D12(NvOFHandle hOf, const NV_OF_BUFFER_USAGE
+     if (log::tracing())
+         log::trace(n, log::fmt::hnd(hOf), bufferUsage, ofMode, log::fmt::ptr(pFormat));
+ 
+-    if (bufferUsage == NV_OF_BUFFER_USAGE_INPUT)
+-        *pFormat = DXGI_FORMAT_R8_UNORM;
+-    else
++    if (bufferUsage == NV_OF_BUFFER_USAGE_INPUT) {
++        pFormat[0] = DXGI_FORMAT_R8_UNORM;
++        pFormat[1] = DXGI_FORMAT_NV12;
++        pFormat[2] = DXGI_FORMAT_B8G8R8A8_UNORM;
++    } else
+         *pFormat = DXGI_FORMAT_R16G16_SINT;
+     return Success(n);
+ }

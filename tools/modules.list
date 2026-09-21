@@ -1,0 +1,2 @@
+# name  git-url  [ref]        - optional modules fetched into modules/<name> by tools/fetch_modules.sh (see docs/module-protocol.md)
+# mako  https://github.com/<owner>/ns-mako   main      # GPL-3.0 module: Lossless Scaling frame generation, MAKO Scaler, LS1 (needs the user's own Lossless Scaling)

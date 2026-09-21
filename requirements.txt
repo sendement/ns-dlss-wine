@@ -1,0 +1,7 @@
+# Python packages (system packages: see README.md)
+numpy
+Pillow
+pywayland
+evdev
+PyGObject
+pycairo

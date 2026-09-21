@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Launcher: starts the live filter with the settings panel.  Usage: ./nsdlss [window-class | address:0x...]
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+export NS_UI="${NS_UI:-1}"
+exec python3 "$ROOT/app/live_filter.py" "$@"
