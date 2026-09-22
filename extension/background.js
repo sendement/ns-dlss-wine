@@ -88,6 +88,8 @@ chrome.runtime.onConnect.addListener((port) => {
       case 'stop':
         if (ws) { try { ws.close(); } catch (e) {} ws = null; wsUrl = null; }
         break;
+      // 'ping' (content.js's MV3 keepalive heartbeat) needs no handling - receiving ANY port message resets this service worker's ~30s idle timer,
+      // which is the whole point of it: without it, a slow bridge reply (e.g. DLSS5's cold-start) could otherwise let Chrome kill this worker mid-wait.
     }
   });
 

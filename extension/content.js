@@ -200,7 +200,11 @@
 
       this.port = chrome.runtime.connect({ name: 'ns-yt' });
       this.port.onMessage.addListener((msg) => this._onMessage(msg));
-      this.port.onDisconnect.addListener(() => log('port disconnected'));
+      this.port.onDisconnect.addListener(() => { log('port disconnected'); clearInterval(this._pingTimer); });
+      // MV3 service workers are terminated after ~30s with no events; a port message resets that timer, but _tick() below stops sending frame messages
+      // entirely while `pending` is maxed out (e.g. the whole multi-second wait for DLSS5's first reply on a cold worker start) - without this, the
+      // background page (and this port, and the WebSocket it holds) can get killed mid-wait, right around when the first real reply would have arrived.
+      this._pingTimer = setInterval(() => { try { this.port.postMessage({ type: 'ping' }); } catch (e) { /* port already gone */ } }, 15000);
     }
 
     layout(crop) {
@@ -327,6 +331,7 @@
 
     destroy() {
       this.running = false;
+      clearInterval(this._pingTimer);
       if (this._vfcHandle && this.video.cancelVideoFrameCallback) this.video.cancelVideoFrameCallback(this._vfcHandle);
       if (this._rafHandle) cancelAnimationFrame(this._rafHandle);
       try { this.port.postMessage({ type: 'stop' }); this.port.disconnect(); } catch (e) { /* already gone */ }
