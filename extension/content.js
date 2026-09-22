@@ -183,6 +183,23 @@
 
   /* ============ BridgeRenderer: captures video frames, talks to background.js, draws the result back ============ */
 
+  // `chrome.runtime.connect()` throws "Extension context invalidated" when this content script was injected by a NOW-RELOADED copy of the extension
+  // (its background context no longer exists) - happens every time the extension is reloaded from chrome://extensions without also refreshing the
+  // tab. Not a bug to fix in code (there is no API to "reconnect" a stale content script to a new extension instance) - just give a clear message
+  // instead of letting the raw exception surface with no explanation.
+  function createRenderer(player, video) {
+    try {
+      return new BridgeRenderer(player, video);
+    } catch (e) {
+      if (e && /Extension context invalidated/.test(e.message || '')) {
+        console.error('[ns-yt] расширение было перезагружено — обновите страницу (F5) и попробуйте снова');
+      } else {
+        console.error('[ns-yt] failed to start:', e);
+      }
+      return null;
+    }
+  }
+
   class BridgeRenderer {
     constructor(player, video) {
       this.player = player;
@@ -386,7 +403,8 @@
     memory.enabled = true; memory.suspended = false;
     memory.ratio = ratioKey(findVideo(player)); memory.posX = s.posX; memory.posY = s.posY;
     const crop = computeSourceCrop(player, s.posX, s.posY);
-    s.renderer = new BridgeRenderer(player, findVideo(player));
+    s.renderer = createRenderer(player, findVideo(player));
+    if (!s.renderer) { turnOff(player); return; }
     if (crop) s.renderer.layout(crop);
     s.renderer.start();
     toggleButtonActive(player, true);
@@ -409,7 +427,8 @@
     if (!applyLayout(player, s) || !verifyLayout(player)) { turnOff(player, true); return false; }
     memory.ratio = memory.ratio ?? ratioKey(video);
     const crop = computeSourceCrop(player, s.posX, s.posY);
-    s.renderer = new BridgeRenderer(player, video);
+    s.renderer = createRenderer(player, video);
+    if (!s.renderer) { turnOff(player, true); return false; }
     if (crop) s.renderer.layout(crop);
     s.renderer.start();
     toggleButtonActive(player, true);
