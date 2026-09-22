@@ -333,23 +333,43 @@
   }
 
   // A button that opens a dropdown panel of arbitrary controls (checkbox + sliders), styled like the fill button's own menus.
+  // Panels are appended to <body> (see below), independent of the player element that owns their trigger button - pruneOrphanPanels() sweeps up ones
+  // whose button fell out of the document (YouTube's SPA navigation tears down and rebuilds the controls row between videos).
+  const allPanels = [];
+  function pruneOrphanPanels() {
+    for (let i = allPanels.length - 1; i >= 0; i--) {
+      if (!allPanels[i].btn.isConnected) { allPanels[i].panel.remove(); allPanels.splice(i, 1); }
+    }
+  }
+
+  // The trigger button lives inline in the player's own control row (.ytp-right-controls) - see buildPanelButtons(). The dropdown itself is appended to
+  // <body> as position:fixed, anchored to the button's on-screen rect, NOT nested under it: YouTube's control bar clips overflowing children on some
+  // layouts, which would hide a CSS-relative dropdown even though the trigger button itself is visible.
   function buildPanel(label, buildContent) {
     const wrap = document.createElement('div'); wrap.className = 'nsyt-panel-wrap';
-    const btn = document.createElement('button'); btn.className = 'nsyt-panel-btn'; btn.textContent = label;
+    const btn = document.createElement('button'); btn.className = 'ytp-button nsyt-panel-btn'; btn.textContent = label;
     const panel = document.createElement('div'); panel.className = 'nsyt-panel'; panel.hidden = true;
     const refreshers = [];
     buildContent(panel, (r) => refreshers.push(r));
+    document.body.appendChild(panel);
+    allPanels.push({ btn, panel });
+
+    const reposition = () => {
+      const r = btn.getBoundingClientRect();
+      panel.style.left = Math.round(Math.min(r.left, window.innerWidth - panel.offsetWidth - 8)) + 'px';
+      panel.style.top = Math.round(r.top - panel.offsetHeight - 6) + 'px';
+    };
     const close = () => { panel.hidden = true; btn.classList.remove('nsyt-open'); };
-    const open = () => { refreshers.forEach((r) => r.refresh && r.refresh()); panel.hidden = false; btn.classList.add('nsyt-open'); };
+    const open = () => { refreshers.forEach((r) => r.refresh && r.refresh()); panel.hidden = false; btn.classList.add('nsyt-open'); reposition(); };
     btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); panel.hidden ? open() : close(); });
     panel.addEventListener('click', (e) => e.stopPropagation());
-    wrap.appendChild(btn); wrap.appendChild(panel);
+    wrap.appendChild(btn);
     return { wrap, btn, panel, close, setOn: (on) => btn.classList.toggle('nsyt-on', on) };
   }
 
-  function buildControls(player) {
-    const bar = document.createElement('div'); bar.className = 'nsyt-bar';
-
+  // The two panel buttons go into the SAME row as the fill button (.ytp-right-controls) - not a separate bar floating over the video, which the player's
+  // own chrome (or our own result canvas) can end up stacked over.
+  function buildPanelButtons(player) {
     const applyAndPersist = (renderer) => { persist(); if (renderer) renderer.reconfigure(); };
     const currentRenderer = () => { const s = STATE.get(player); return s && s.renderer; };
 
@@ -369,10 +389,11 @@
     dlss5Panel.setOn(settings.dlss5.enabled);
     fgPanel.setOn(settings.framegen.enabled);
 
-    bar.appendChild(dlss5Panel.wrap);
-    bar.appendChild(fgPanel.wrap);
-    document.addEventListener('pointerdown', (e) => { if (!bar.contains(e.target)) { dlss5Panel.close(); fgPanel.close(); } }, true);
-    return bar;
+    document.addEventListener('pointerdown', (e) => {
+      if (!dlss5Panel.wrap.contains(e.target) && !dlss5Panel.panel.contains(e.target)) dlss5Panel.close();
+      if (!fgPanel.wrap.contains(e.target) && !fgPanel.panel.contains(e.target)) fgPanel.close();
+    }, true);
+    return [dlss5Panel.wrap, fgPanel.wrap];
   }
 
   function ensureButton(player) {
@@ -389,17 +410,16 @@
       s.active ? turnOff(player) : turnOn(player);
     });
     controls.insertBefore(btn, controls.firstChild);
+    // panel buttons to the LEFT of the fill button, same row, same order every time: [DLSS5] [Кадры] [fill]
+    buildPanelButtons(player).reverse().forEach((wrap) => controls.insertBefore(wrap, btn));
 
-    if (!player.querySelector('.nsyt-bar')) player.appendChild(buildControls(player));
     updateButtonVisibility(player);
   }
 
   function updateButtonVisibility(player) {
-    const btn = player.querySelector('.nsyt-button');
-    const bar = player.querySelector('.nsyt-bar');
     const show = isFullscreen();
-    if (btn) btn.style.display = show ? '' : 'none';
-    if (bar) bar.style.display = show ? '' : 'none';
+    player.querySelectorAll('.nsyt-button, .nsyt-panel-wrap').forEach((el) => { el.style.display = show ? '' : 'none'; });
+    if (!show) document.querySelectorAll('.nsyt-panel').forEach((p) => { p.hidden = true; });   // panels live on <body> (see buildPanel), not under player
   }
 
   function eachPlayer(fn) { document.querySelectorAll('.html5-video-player').forEach(fn); }
@@ -412,6 +432,7 @@
   document.addEventListener('yt-navigate-finish', () => {
     init();
     eachPlayer((player) => { const s = STATE.get(player); if (s && s.active) turnOff(player); });
+    pruneOrphanPanels();
   });
 
   function onFullscreenChange() {

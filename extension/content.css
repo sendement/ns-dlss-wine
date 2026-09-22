@@ -10,40 +10,32 @@
   z-index: 2;
 }
 
-.nsyt-bar {
-  position: absolute;
-  right: 12px;
-  bottom: 56px;
-  z-index: 3;
-  display: flex;
-  gap: 8px;
-  font-family: "YouTube Sans", Roboto, Arial, sans-serif;
-}
-
-.nsyt-panel-wrap { position: relative; }
+/* Trigger buttons sit inline in YouTube's own .ytp-right-controls row, next to the fill button. */
+.nsyt-panel-wrap { display: inline-flex; align-items: center; }
 
 .nsyt-panel-btn {
-  background: rgba(28, 28, 28, 0.85);
-  color: #fff;
-  border: 1px solid rgba(255, 255, 255, 0.25);
-  border-radius: 4px;
-  padding: 6px 12px;
+  width: auto !important;
+  padding: 0 10px;
+  font-family: "YouTube Sans", Roboto, Arial, sans-serif;
   font-size: 13px;
-  cursor: pointer;
+  color: #fff;
+  white-space: nowrap;
 }
-.nsyt-panel-btn.nsyt-on { border-color: #3ea6ff; color: #3ea6ff; }
-.nsyt-panel-btn.nsyt-open { background: rgba(50, 50, 50, 0.95); }
+.nsyt-panel-btn.nsyt-on { color: #3ea6ff; }
+.nsyt-panel-btn.nsyt-open { background: rgba(255, 255, 255, 0.15); }
 
+/* The dropdown itself lives on <body> (see content.js: buildPanel), positioned by JS from the trigger button's screen rect - NOT nested under the
+   control row, which clips overflowing children on some YouTube layouts. Max z-index: above the fullscreen player's own stacking context. */
 .nsyt-panel {
-  position: absolute;
-  bottom: calc(100% + 6px);
-  right: 0;
+  position: fixed;
+  z-index: 2147483647;
   min-width: 220px;
   background: rgba(20, 20, 20, 0.95);
   border: 1px solid rgba(255, 255, 255, 0.15);
   border-radius: 6px;
   padding: 10px 12px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  font-family: "YouTube Sans", Roboto, Arial, sans-serif;
 }
 
 .nsyt-row {
