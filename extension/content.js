@@ -297,6 +297,7 @@
         case 'ws_open': log('bridge connected'); break;
         case 'ws_error': console.warn('[ns-yt]', msg.message); this.pending = 0; break;
         case 'ws_closed': log('bridge disconnected'); this.pending = 0; break;
+        case 'bg_error': console.error('[ns-yt:bg]', msg.message); break;
         case 'config_ack':
           log('config_ack', msg.ok ? 'ok' : 'REJECTED: ' + msg.error);
           if (!msg.ok) console.warn('[ns-yt] pipeline configuration rejected:', msg.error);

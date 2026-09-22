@@ -83,28 +83,36 @@ chrome.runtime.onConnect.addListener((port) => {
   };
 
   port.onMessage.addListener((msg) => {
-    switch (msg.type) {
-      case 'configure': {
-        connect(msg.wsUrl || 'ws://127.0.0.1:8765');
-        const cfgStr = JSON.stringify(msg.config);
-        if (ws.readyState === WebSocket.OPEN) ws.send(cfgStr); else pendingConfig = cfgStr;
-        break;
+    // This listener runs in the service worker's OWN context - an uncaught exception here goes to chrome://extensions' "service worker" console,
+    // never to the tab's DevTools console content.js logs to. That makes it invisible to the usual "paste me the console log" workflow, so report
+    // it back over the port too (content.js logs it as [ns-yt:bg]) instead of letting it vanish silently.
+    try {
+      switch (msg.type) {
+        case 'configure': {
+          connect(msg.wsUrl || 'ws://127.0.0.1:8765');
+          const cfgStr = JSON.stringify(msg.config);
+          if (ws.readyState === WebSocket.OPEN) ws.send(cfgStr); else pendingConfig = cfgStr;
+          break;
+        }
+        case 'frame': {
+          if (!ws) break;
+          if (!msg.buffer) { safeSend({ type: 'bg_error', message: 'frame message arrived with no buffer (seq=' + msg.seq + ')' }); break; }
+          const hdr = buildSrcHeader(msg.seq, msg.w, msg.h);
+          const out = new Uint8Array(SRC_HDR_BYTES + msg.buffer.byteLength);
+          out.set(new Uint8Array(hdr), 0);
+          out.set(new Uint8Array(msg.buffer), SRC_HDR_BYTES);
+          if (ws.readyState === WebSocket.OPEN) ws.send(out.buffer); else pendingFrame = out.buffer;
+          break;
+        }
+        case 'stop':
+          pendingConfig = pendingFrame = null;
+          if (ws) { try { ws.close(); } catch (e) {} ws = null; wsUrl = null; }
+          break;
+        // 'ping' (content.js's MV3 keepalive heartbeat) needs no handling - receiving ANY port message resets this service worker's ~30s idle timer,
+        // which is the whole point of it: without it, a slow bridge reply (e.g. DLSS5's cold-start) could otherwise let Chrome kill this worker mid-wait.
       }
-      case 'frame': {
-        if (!ws) break;
-        const hdr = buildSrcHeader(msg.seq, msg.w, msg.h);
-        const out = new Uint8Array(SRC_HDR_BYTES + msg.buffer.byteLength);
-        out.set(new Uint8Array(hdr), 0);
-        out.set(new Uint8Array(msg.buffer), SRC_HDR_BYTES);
-        if (ws.readyState === WebSocket.OPEN) ws.send(out.buffer); else pendingFrame = out.buffer;
-        break;
-      }
-      case 'stop':
-        pendingConfig = pendingFrame = null;
-        if (ws) { try { ws.close(); } catch (e) {} ws = null; wsUrl = null; }
-        break;
-      // 'ping' (content.js's MV3 keepalive heartbeat) needs no handling - receiving ANY port message resets this service worker's ~30s idle timer,
-      // which is the whole point of it: without it, a slow bridge reply (e.g. DLSS5's cold-start) could otherwise let Chrome kill this worker mid-wait.
+    } catch (e) {
+      safeSend({ type: 'bg_error', message: (e && e.message) || String(e) });
     }
   });
 
