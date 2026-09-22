@@ -1,6 +1,7 @@
 # Live neural screen filter for Linux (DLSS5 / upscaling / frame generation)
 
-A live filter for any Wayland window on Linux: it takes the window's picture, runs it through the **DLSS5 neural-rendering model** (in a Wine helper process),
+A live filter for any Wayland window on Linux: it takes the window's picture, runs it through the **DLSS5 neural-rendering model** (through an open, documented protocol -
+`docs/worker-protocol.md` - a reference adapter, `hosts/worker_adapter.cpp`, speaks it to NeuralScreen's Wine worker; a different worker could plug in without Wine at all),
 optionally upscales it (NIS, FSR 1, RTX Video Super Resolution; MAKO Scaler / LS1 through the optional `ns-mako` module), optionally inserts **generated frames** (NVIDIA DLSS frame
 generation, AMD FSR 3.1 frame generation; Lossless Scaling frame generation through `ns-mako`) and puts the result back over the window - all controlled live from a small settings panel.
 
@@ -63,7 +64,7 @@ Hotkeys are Hyprland binds you add yourself: `SIGUSR2` shows/hides the panel, `S
 `hyprplug/nested/run_result_tear.sh` (tearing checks), `hyprplug/nested/run_dup.sh`, `run_retarget.sh`, `run_live_fg.sh` (end-to-end). Always address a nested compositor with `hyprctl -i <signature>`.
 
 ## Repository layout
-`app/` the filter (Python + small C libraries) - `hyprplug/` the Hyprland plugin - `hosts/` frame-generation / upscaler hosts (native Linux and Wine) - `modules/` optional third-party modules (git-ignored) - `shim/` nvcuda shim generator - `patches/` vkd3d-proton / dxvk-nvapi patches
+`app/` the filter (Python + small C libraries) - `hyprplug/` the Hyprland plugin - `hosts/` neural-render worker / frame-generation / upscaler hosts (native Linux and Wine) - `modules/` optional third-party modules (git-ignored) - `shim/` nvcuda shim generator - `patches/` vkd3d-proton / dxvk-nvapi patches
 `tools/` setup and build scripts - `dev/` probes and benchmarks - `docs/` licensing, development log - `user_files/` you drop your files here - `runtime/`, `third_party/` (git-ignored, created by the scripts).
 
 ## Optional modules

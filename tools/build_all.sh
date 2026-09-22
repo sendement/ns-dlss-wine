@@ -31,6 +31,7 @@ else skip "Hyprland plugin" "hyprland development headers / cmake not found"; fi
 
 if have x86_64-w64-mingw32-g++; then
   CXX="x86_64-w64-mingw32-g++"
+  step "hosts/worker_adapter.exe" bash -c "$CXX -O2 -std=c++17 -o '$ART/worker_adapter.exe' '$ROOT/hosts/worker_adapter.cpp' -static"
   step "hosts/dlssg_host.exe"   bash -c "$CXX -O2 -std=c++17 -o '$ART/dlssg_host.exe' '$ROOT/hosts/dlssg_host.cpp' -static"
   NGX="$ROOT/third_party/nvidia-dlss/include"
   if [ -d "$NGX" ]; then
@@ -41,7 +42,6 @@ if have x86_64-w64-mingw32-g++; then
     step "hosts/ngxdlssg_vk_host (native Linux DLSS-G)" bash -c "g++ -O2 -std=c++17 -mavx2 -mf16c -pthread -I'$NGX' -o '$ART/ngxdlssg_vk_host' '$ROOT/hosts/ngxdlssg_vk_host.cpp' '$NGXL/libnvsdk_ngx.a' -ldl -lvulkan && cp -f '$NGXL/rel/'libnvidia-ngx-dlssg.so.* '$ART/'"
   else skip "hosts/ngxdlssg_vk_host (native Linux DLSS-G)" "run tools/fetch_third_party.sh (NVIDIA/DLSS Linux libraries) and install g++ + the Vulkan headers"; fi
   step "hosts/vsr_host.exe"     bash -c "$CXX -O2 -std=c++17 -o '$ART/vsr_host.exe' '$ROOT/hosts/vsr_host.cpp' -static"
-  step "hosts/shm_bridge.exe"   bash -c "$CXX -O2 -o '$ART/shm_bridge.exe' '$ROOT/hosts/shm_bridge.cpp' -static"
   SDK="$ROOT/third_party/fidelityfx-sdk/Kits/FidelityFX"
   if [ -d "$SDK/api/include" ]; then
     step "hosts/fsr3fg_host.exe" bash -c "$CXX -O2 -std=c++17 -mavx2 -mf16c -I'$SDK/api/include' -I'$SDK/framegeneration/include' -o '$ART/fsr3fg_host.exe' '$ROOT/hosts/fsr3fg_host.cpp' -static -ldxguid"

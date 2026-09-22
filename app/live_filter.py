@@ -29,6 +29,7 @@ from nis_upscale import NisUpscaler
 from live_state import LiveState, DlssParams
 from upscalers import REGISTRY as UPSCALER_REGISTRY
 from framegen import REGISTRY as FRAMEGEN_REGISTRY, FrameGenSettings, uniform_timestamps
+from worker import Worker
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -41,9 +42,6 @@ import userfiles
 
 HERE = paths.APP_DIR
 
-WORKER_DIR = os.environ.get("NS_WORKER_DIR", paths.WORKER_DLSS5)
-WINEPREFIX = paths.PREFIX
-WINE = paths.wine_binary()
 
 
 def preflight_or_exit():
@@ -60,7 +58,6 @@ def preflight_or_exit():
 CLI_WINDOW_CLASS = sys.argv[1] if len(sys.argv) > 1 else None
 WINDOW_CLASS = CLI_WINDOW_CLASS or "vivaldi-stable"
 MAX_DIM = int(os.environ.get("NS_MAX_DIM", "800"))
-USE_SHM = os.environ.get("NS_USE_SHM", "0") == "1"
 DISPLAY_CARD = os.environ.get("NS_DRM_CARD") or detect_display_card()
 # Capture+DLSS run at 1/NIS_FACTOR linear resolution, NIS upscales the
 # DLSS-cleaned result back up to the full NS_MAX_DIM-derived size - see
@@ -69,28 +66,6 @@ DISPLAY_CARD = os.environ.get("NS_DRM_CARD") or detect_display_card()
 # this does, since capture/IPC/NGX compute all happen at the small size).
 NIS_FACTOR = float(os.environ.get("NS_NIS_FACTOR", "1"))
 NIS_SHARPNESS = float(os.environ.get("NS_NIS_SHARPNESS", "0.5"))
-
-VIDEO_MAGIC = 0x33563544
-RESIZE_MAGIC = 0x5A534E52   # "RNSZ" - live reconfigure, see dlss5-feed-host64.cpp's RunVideo()
-RESIZE_ACK_MAGIC = 0x4B434152  # "RACK"
-FRAME_MAGIC = 0x314D5246
-OUT_MAGIC = 0x3154554F
-SHM_MAGIC = 0x494D4853
-OUTS_MAGIC = 0x5354554F
-OUT_BYTES_IN_SHM = 0xFFFFFFFF
-FRAME_FLAG_SHM = 0x1
-RESIZE_FLAG_NR_SMALL = 0x1
-HEADER_FMT = "<10I4f2I"       # VideoHeader - also VideoResizeCmd's exact layout (RNSZ reuses it)
-FRAME_FMT = "<4Iq"
-OUT_FMT = "<5Iq"
-RESIZE_ACK_FMT = "<4Iq"       # VideoResizeAck: magic, ok, ngx_result, reserved, pts
-SHM_FMT = "<4Iq64s"
-OUTS_FMT = "<4Iq64s"
-
-
-# DlssParams itself lives in live_state.py, not here - see the import at
-# the top of this file.
-
 
 def list_open_windows():
     """[(class, title)] of mapped, visible toplevels - for the target picker."""
@@ -590,233 +565,6 @@ def read_exact(stream, size):
     return bytes(buf)
 
 
-class Worker:
-    def __init__(self, w, h, full_w=0, full_h=0, params: "DlssParams | None" = None):
-        self.params = params or DlssParams()
-        userfiles.require("dlss5")
-        env = dict(os.environ)
-        env["WINEPREFIX"] = WINEPREFIX
-        env.setdefault("__NV_PRIME_RENDER_OFFLOAD", "1")
-        env.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
-        env.setdefault("VK_ICD_FILENAMES", "/usr/share/vulkan/icd.d/nvidia_icd.json")
-        env["WINEDLLOVERRIDES"] = "dxgi,d3d12,d3d12core=n"
-        upscale = full_w > 0 and full_h > 0 and (full_w != w or full_h != h)
-        if upscale:
-            # Run the network at the smaller work resolution instead of the
-            # full display size - both the GPU pass and (more importantly
-            # for us) the color/motion payload we upload shrink to w x h;
-            # NGX reconstructs the full_w x full_h output on the GPU.
-            env["NS_NR_SMALL"] = "1"
-        self.w, self.h = w, h
-        self.out_w, self.out_h = (full_w, full_h) if upscale else (w, h)
-        self.use_shm = USE_SHM
-        self._bridge = None
-        self._in_mm = self._out_mm = None
-        if self.use_shm:
-            self._start_shm_bridge(env)
-        self.proc = subprocess.Popen(
-            [WINE, "nvngx.dll", "--live"],
-            cwd=WORKER_DIR,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=env,
-        )
-        threading.Thread(target=self._drain_stderr, daemon=True).start()
-        header = self._pack_video_params(VIDEO_MAGIC, w, h, 0, 0, self.params, full_w, full_h)
-        self.proc.stdin.write(header)
-        self.proc.stdin.flush()
-        if self.use_shm:
-            # A shorter delay here hit one SHMI failure in 3 test runs even
-            # with the bridge's real bug (stdin-EOF exit) fixed - see
-            # ../README.md's "SHM transport" section. 2s was reliable 4/4.
-            time.sleep(2.0)
-            self.proc.stdin.write(struct.pack(
-                SHM_FMT, SHM_MAGIC, self._color_bytes, self._motion_bytes_len, 0, 0,
-                self._in_name.encode("ascii")))
-            self.proc.stdin.flush()
-            self.proc.stdin.write(struct.pack(
-                OUTS_FMT, OUTS_MAGIC, self.out_w, self.out_h, 0, 0,
-                self._out_name.encode("ascii")))
-            self.proc.stdin.flush()
-        # The motion field is always zero (no real motion estimation here) -
-        # serialize it once instead of re-converting on every frame.
-        self._motion_bytes = np.zeros((h, w, 2), dtype=np.float16).tobytes()
-        self.index = 0
-        self.last_write_ms = self.last_wait_ms = self.last_read_ms = 0.0
-
-    @staticmethod
-    def _pack_video_params(magic, w, h, slot4, slot5, params: "DlssParams", full_w, full_h):
-        # slot4/slot5 mean different things depending on `magic`: for the
-        # initial VIDEO_MAGIC header they're (warmup, frame_count); for a
-        # RNSZ reconfigure they're (warmup, flags) - VideoResizeCmd reuses
-        # VideoHeader's exact layout on purpose (see dlss5-feed-host64.cpp),
-        # so one packer serves both.
-        return struct.pack(
-            HEADER_FMT, magic, w, h, slot4, slot5,
-            0, 0,  # profile, preset - dead fields in the worker, always 0
-            params.style, params.auto_mask, params.ui_correction,
-            params.intensity, params.local_tone, params.local_structure, params.skin_structure,
-            full_w, full_h,
-        )
-
-    def reconfigure(self, w, h, full_w=0, full_h=0, params: "DlssParams | None" = None, flags=0):
-        """Live in-place reconfigure via RNSZ - no Wine process restart.
-        The worker always tears down and recreates the NGX feature on
-        receipt (even if only a param changed, size identical) - cheap
-        relative to a full restart, but not free; callers should debounce,
-        not call this on every slider tick.
-        """
-        if params is not None:
-            self.params = params
-        if self.use_shm:
-            new_color_bytes = w * h * 4
-            new_out_bytes = (full_w or w) * (full_h or h) * 4 + 8
-            if new_color_bytes > self._color_bytes or new_out_bytes > self._out_bytes:
-                raise ValueError(
-                    f"reconfigure({w}x{h}, full={full_w}x{full_h}) exceeds the SHM buffers "
-                    f"allocated at Worker construction time ({self.w}x{self.h}/{self.out_w}x"
-                    f"{self.out_h}) - construct the Worker with its largest-ever resolution "
-                    f"up front (SHM capacity is fixed for the worker's lifetime, see "
-                    f"../README.md's SHM section and dlss5-feed-host64.cpp's SHMI comment)"
-                )
-        pkt = self._pack_video_params(RESIZE_MAGIC, w, h, 0, flags, self.params, full_w, full_h)
-        self.proc.stdin.write(pkt)
-        self.proc.stdin.flush()
-        # Skip any late 24-byte reply that isn't ours (e.g. the initial
-        # CACK if no frame has been processed yet) - same as process() does.
-        while True:
-            raw = read_exact(self.proc.stdout, struct.calcsize(RESIZE_ACK_FMT))
-            magic, ok, ngx_result, _reserved, _pts = struct.unpack(RESIZE_ACK_FMT, raw)
-            if magic == RESIZE_ACK_MAGIC:
-                break
-        if not ok:
-            raise RuntimeError(f"reconfigure({w}x{h}) rejected by worker, ngx_result=0x{ngx_result:08x}")
-        self.w, self.h = w, h
-        upscale = full_w > 0 and full_h > 0 and (full_w != w or full_h != h)
-        self.out_w, self.out_h = (full_w, full_h) if upscale else (w, h)
-        self._motion_bytes = np.zeros((h, w, 2), dtype=np.float16).tobytes()
-
-    def _start_shm_bridge(self, env):
-        pid = os.getpid()
-        shm_dir = f"/tmp/ns-live-shm-{pid}"
-        os.makedirs(shm_dir, exist_ok=True)
-        in_path = os.path.join(shm_dir, "in.bin")
-        out_path = os.path.join(shm_dir, "out.bin")
-        self._quit_path = in_path + ".quit"
-        self._color_bytes = self.w * self.h * 4
-        self._motion_bytes_len = self.w * self.h * 4  # float16 x2 channels
-        self._out_bytes = self.out_w * self.out_h * 4 + 8  # + seqlock
-        out_bytes = self._out_bytes
-        self._in_name = f"NS_LIVE_IN_{pid}"
-        self._out_name = f"NS_LIVE_OUT_{pid}"
-        win_in = "Z:" + in_path.replace("/", "\\")
-        win_out = "Z:" + out_path.replace("/", "\\")
-        self._bridge = subprocess.Popen(
-            [WINE, "shm_bridge.exe",
-             win_in, str(self._color_bytes + self._motion_bytes_len), self._in_name,
-             win_out, str(out_bytes), self._out_name],
-            cwd=paths.ARTIFACTS,   # shm_bridge.exe (optional legacy transport, built by tools/build_all.sh)
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=env,
-        )
-        threading.Thread(target=self._drain_bridge_stderr, daemon=True).start()
-        ready = self._bridge.stdout.readline()
-        if b"READY" not in ready:
-            raise RuntimeError(f"shm_bridge did not become ready: {ready!r}")
-        with open(in_path, "r+b") as f:
-            self._in_mm = mmap.mmap(f.fileno(), 0)
-        with open(out_path, "r+b") as f:
-            self._out_mm = mmap.mmap(f.fileno(), 0)
-        print(f"[live] SHM bridge ready: in={in_path} out={out_path}")
-
-    def _drain_bridge_stderr(self):
-        for line in iter(self._bridge.stderr.readline, b""):
-            sys.stderr.write("[bridge] " + line.decode(errors="replace"))
-
-    def _drain_stderr(self):
-        for line in iter(self.proc.stderr.readline, b""):
-            sys.stderr.write("[worker] " + line.decode(errors="replace"))
-
-    def process(self, rgba: np.ndarray) -> np.ndarray | None:
-        i = self.index
-        self.index += 1
-        t0 = time.monotonic()
-        if self.use_shm:
-            # rgba is already contiguous uint8; the motion field is always
-            # zero, so only the color region actually needs writing.
-            self._in_mm[0:self._color_bytes] = rgba.data
-            self.proc.stdin.write(struct.pack(FRAME_FMT, FRAME_MAGIC, i, int(i == 0), FRAME_FLAG_SHM, i))
-        else:
-            self.proc.stdin.write(struct.pack(FRAME_FMT, FRAME_MAGIC, i, int(i == 0), 0, i))
-            # rgba is already a contiguous uint8 array - hand the buffer
-            # straight to write() instead of copying into bytes first.
-            self.proc.stdin.write(rgba.data)
-            self.proc.stdin.write(self._motion_bytes)
-        self.proc.stdin.flush()
-        t1 = time.monotonic()
-        while True:
-            magic_raw = read_exact(self.proc.stdout, 4)
-            magic = struct.unpack("<I", magic_raw)[0]
-            if magic == OUT_MAGIC:
-                break
-            # Skip any other reply (e.g. the initial CACK verdict, or SACK/
-            # OAK2 if they arrive late) - not ours to handle here, but it
-            # still has the same 24-byte shape.
-            read_exact(self.proc.stdout, 20)
-        rest = read_exact(self.proc.stdout, struct.calcsize(OUT_FMT) - 4)
-        _m, out_index, ok, byte_count, ngx_result, _pts = struct.unpack(OUT_FMT, magic_raw + rest)
-        t2 = time.monotonic()
-        self.last_write_ms = (t1 - t0) * 1000
-        self.last_wait_ms = (t2 - t1) * 1000
-        if not byte_count:
-            self.last_read_ms = 0.0
-            return None
-        if byte_count == OUT_BYTES_IN_SHM:
-            # Seqlock: first 8 bytes, odd while the worker is mid-write.
-            # Retry a few times; give up (skip the frame) on a persistent
-            # tear rather than risk showing a torn frame.
-            out = None
-            for _ in range(4):
-                seq1 = int.from_bytes(self._out_mm[0:8], "little")
-                if seq1 & 1:
-                    continue
-                buf = np.frombuffer(
-                    self._out_mm, dtype=np.uint8, count=self.out_w * self.out_h * 4, offset=8
-                ).reshape(self.out_h, self.out_w, 4).copy()
-                seq2 = int.from_bytes(self._out_mm[0:8], "little")
-                if seq1 == seq2:
-                    out = buf
-                    break
-            self.last_read_ms = (time.monotonic() - t2) * 1000
-            return out
-        data = read_exact(self.proc.stdout, byte_count)
-        out = np.frombuffer(data, dtype=np.uint8).reshape(self.out_h, self.out_w, 4).copy()
-        self.last_read_ms = (time.monotonic() - t2) * 1000
-        return out
-
-    def close(self):
-        try:
-            self.proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            self.proc.wait(timeout=5)
-        except Exception:
-            self.proc.kill()
-        if self._in_mm is not None:
-            self._in_mm.close()
-        if self._out_mm is not None:
-            self._out_mm.close()
-        if self._bridge is not None:
-            try:
-                open(self._quit_path, "w").close()
-            except Exception:
-                pass
-            try:
-                self._bridge.wait(timeout=5)
-            except Exception:
-                self._bridge.kill()
-
-
 class PreviewWindow(Gtk.Window):
     def __init__(self, w, h):
         super().__init__()
@@ -1025,13 +773,10 @@ def main_ui():
     print(f"[live] monitor {mon_name} {mon_w}x{mon_h} at {mon_x},{mon_y}")
 
     initial_params = DlssParams()
-    # Construct at the LARGEST size the slider can ever reach (native/100%)
-    # so the SHM buffers (if NS_USE_SHM=1) are sized for it up front - see
-    # Worker.reconfigure()'s capacity check and the SHMI comment in
-    # dlss5-feed-host64.cpp ("capacity, not the per-frame size"). The
-    # slider then starts at 100% too, matching this - no extra reconfigure
-    # needed at startup.
-    worker = Worker(display_w, display_h, 0, 0, params=initial_params)
+    # Construct with a ceiling covering the LARGEST size the resolution slider can ever reach (native/100%) - Worker.reconfigure() enforces it, since the
+    # worker's mmap regions are sized once at start-up (see worker.py / docs/worker-protocol.md). The slider starts at 100% too, matching this - no extra
+    # reconfigure needed at startup.
+    worker = Worker(display_w, display_h, 0, 0, params=initial_params, max_w=display_w, max_h=display_h)
     import screen_overlay as _so
     _so.PROFILE_CB = PROF.add  # no-op unless profiling is on
     if PLUGIN:
@@ -1260,7 +1005,7 @@ def main_ui():
         worker.close()
         os.environ["NS_NR_PRESET"] = str(preset)
         stop.clear()
-        worker = Worker(*state.resolution, params=state.params)
+        worker = Worker(*state.resolution, params=state.params, max_w=display_w, max_h=display_h)
         threads["capture"] = threading.Thread(target=capture_loop, daemon=True)
         threads["process"] = threading.Thread(target=process_loop, daemon=True)
         threads["capture"].start()

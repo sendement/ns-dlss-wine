@@ -46,6 +46,7 @@ FEATURES = {f.key: f for f in (
         Item("nvngx_dlssnr.dll", "NeuralScreen (perseval-BLR): native/nvngx_dlssnr.dll"),
         Item("Spout.dll", "NeuralScreen (perseval-BLR): native/Spout.dll"),
         Item("SpoutDX.dll", "NeuralScreen (perseval-BLR): native/SpoutDX.dll"),
+        Item("worker_adapter.exe", "built from hosts/worker_adapter.cpp by tools/build_all.sh (docs/worker-protocol.md)", build=True),
     ), needs=("wine",)),
     Feature("vsr", "RTX Video Super Resolution upscaler", paths.WORKER_VSR, (
         Item("nvngx_vsr.dll", "Visual Enhancer (Merserk): bin/runtime/rtx_video/"),
