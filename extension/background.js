@@ -52,8 +52,12 @@ chrome.runtime.onConnect.addListener((port) => {
   let pendingConfig = null;
   let pendingFrame = null;
 
-  const safeSend = (msg, transfer) => {
-    try { transfer ? port.postMessage(msg, transfer) : port.postMessage(msg); } catch (e) { /* port already closed */ }
+  // chrome.runtime.Port.postMessage() takes ONE argument - it has no transferable-objects overload (that's a window.postMessage-only feature). Passing
+  // a second "transfer list" argument is not an error, but it is silently ignored, and worse: it looks like it works (no exception) while every
+  // ArrayBuffer field arrives on the other end as an empty {} (byteLength undefined) - the actual root cause behind every "0 frames" report so far.
+  // Just pass the message; structured clone copies ArrayBuffer contents by value on its own, no special API needed.
+  const safeSend = (msg) => {
+    try { port.postMessage(msg); } catch (e) { /* port already closed */ }
   };
 
   const flushPending = () => {
@@ -78,7 +82,7 @@ chrome.runtime.onConnect.addListener((port) => {
       }
       const hdr = parseOutHeader(ev.data);
       const pixels = ev.data.slice(OUT_HDR_BYTES);
-      safeSend({ type: 'output', ...hdr, buffer: pixels }, [pixels]);
+      safeSend({ type: 'output', ...hdr, buffer: pixels });
     };
   };
 

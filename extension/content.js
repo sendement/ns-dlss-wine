@@ -285,11 +285,14 @@
       this.pending++;
       if (this.seq === 1) log('sending the first frame (' + c.sw + 'x' + c.sh + ') - a first DLSS5/frame-generation reply can take several seconds while its worker process starts up');
       else if (this.seq % 60 === 0) log('sent', this.seq, 'frames, received', this.received || 0);
-      // Kept for _onOutput's objective before/after diff (postMessage below TRANSFERS data.data.buffer - it becomes unusable here right after, hence the copy).
+      // Kept for _onOutput's objective before/after diff.
       if (!this._sourceCache) this._sourceCache = new Map();
       this._sourceCache.set(this.seq, data.data.slice());
       if (this._sourceCache.size > 4) this._sourceCache.delete(Math.min(...this._sourceCache.keys()));
-      this.port.postMessage({ type: 'frame', seq: this.seq, w: c.sw, h: c.sh, buffer: data.data.buffer }, [data.data.buffer]);
+      // chrome.runtime.Port.postMessage() has no transferable-objects overload (unlike window.postMessage) - a second "transfer list" argument here is
+      // silently ignored rather than rejected, which looks like it works but actually makes every ArrayBuffer field arrive on the other end as an
+      // empty {} (byteLength undefined). Just send the message; structured clone copies the buffer's bytes by value on its own.
+      this.port.postMessage({ type: 'frame', seq: this.seq, w: c.sw, h: c.sh, buffer: data.data.buffer });
     }
 
     _onMessage(msg) {
