@@ -152,6 +152,8 @@ async def handle(ws):
             if magic != b"SRC1" or len(msg) < SRC_HDR.size + w * h * 4:
                 continue
             rgba = np.frombuffer(msg, dtype=np.uint8, count=w * h * 4, offset=SRC_HDR.size).reshape(h, w, 4)
+            if seq == 1:
+                log(f"received first frame ({w}x{h}), dispatching to pipeline - can take up to 90s if the worker is still loading its model")
             t0 = time.perf_counter()
             try:
                 # Worker/upscaler/framegen calls are synchronous (time.sleep spin-waits, designed for live_filter.py's own threads) - run this off the event
@@ -168,7 +170,9 @@ async def handle(ws):
                 payload = frame.tobytes()
                 header = OUT_HDR.pack(b"OUT1", seq, idx, count, fw, fh, 1 if is_bgra else 0, pts_ms)
                 await ws.send(header + payload)
-            if dt > 40:
+            if seq == 1:
+                log(f"first frame processed in {dt:.1f} ms -> {count} output(s)")
+            elif dt > 40:
                 log(f"slow frame: {dt:.1f} ms for {count} output(s)")
     except websockets.exceptions.ConnectionClosed:
         pass
