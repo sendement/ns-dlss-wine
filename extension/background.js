@@ -100,7 +100,12 @@ chrome.runtime.onConnect.addListener((port) => {
         }
         case 'frame': {
           if (!ws) break;
-          if (!msg.buffer) { safeSend({ type: 'bg_error', message: 'frame message arrived with no buffer (seq=' + msg.seq + ')' }); break; }
+          if (msg.seq === 1) {
+            safeSend({ type: 'bg_error', message: 'frame debug: typeof=' + typeof msg.buffer + ' ctor=' +
+              (msg.buffer && msg.buffer.constructor && msg.buffer.constructor.name) + ' byteLength=' + (msg.buffer && msg.buffer.byteLength) +
+              ' keys=' + (msg.buffer && typeof msg.buffer === 'object' ? Object.keys(msg.buffer).join(',') : '') });
+          }
+          if (!msg.buffer || !msg.buffer.byteLength) { safeSend({ type: 'bg_error', message: 'frame message arrived with no usable buffer (seq=' + msg.seq + ')' }); break; }
           const hdr = buildSrcHeader(msg.seq, msg.w, msg.h);
           const out = new Uint8Array(SRC_HDR_BYTES + msg.buffer.byteLength);
           out.set(new Uint8Array(hdr), 0);
