@@ -62,8 +62,13 @@ class Pipeline:
         d = cfg.get("dlss5") or {}
         if d.get("enabled"):
             # Render at `scale` of the cropped size, reconstruct straight back up to src_w/src_h (full_w/full_h below) - DLSS5's own built-in upscale.
+            # wh is DERIVED from ww via the crop's own aspect ratio, not floored independently: DLSS5's reconstruction corrupts its output (a sheared,
+            # mostly-black image, confirmed by dumping the raw output frame) when the work size's aspect ratio doesn't exactly match the full size's -
+            # independent per-axis rounding drifts them apart for most crop sizes (e.g. 1222x1080 at scale=0.25 gave a 1222x1080 crop, work 304x270:
+            # aspect 1.126 vs the crop's 1.131 - close, but not exact, and that was enough to break the reconstruction).
             scale = max(0.1, min(1.0, float(d.get("scale", 0.5))))
-            ww, wh = max(2, int(src_w * scale) & ~1), max(2, int(src_h * scale) & ~1)
+            ww = max(2, int(src_w * scale) & ~1)
+            wh = max(2, int(round(ww * src_h / src_w)) & ~1)
             params = DlssParams(style=int(d.get("style", 1)), auto_mask=int(d.get("auto_mask", 0)),
                                 ui_correction=int(d.get("ui_correction", 0)), intensity=float(d.get("intensity", 1.0)),
                                 local_tone=float(d.get("local_tone", 1.0)), local_structure=float(d.get("local_structure", 1.0)),
