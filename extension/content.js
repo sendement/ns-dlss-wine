@@ -260,6 +260,10 @@
       this.pending++;
       if (this.seq === 1) log('sending the first frame (' + c.sw + 'x' + c.sh + ') - a first DLSS5/frame-generation reply can take several seconds while its worker process starts up');
       else if (this.seq % 60 === 0) log('sent', this.seq, 'frames, received', this.received || 0);
+      // Kept for _onOutput's objective before/after diff (postMessage below TRANSFERS data.data.buffer - it becomes unusable here right after, hence the copy).
+      if (!this._sourceCache) this._sourceCache = new Map();
+      this._sourceCache.set(this.seq, data.data.slice());
+      if (this._sourceCache.size > 4) this._sourceCache.delete(Math.min(...this._sourceCache.keys()));
       this.port.postMessage({ type: 'frame', seq: this.seq, w: c.sw, h: c.sh, buffer: data.data.buffer }, [data.data.buffer]);
     }
 
@@ -279,11 +283,38 @@
     _onOutput(msg) {
       this.received = (this.received || 0) + 1;
       if (this.received === 1) log('first processed frame received (' + msg.w + 'x' + msg.h + (msg.flags & 1 ? ', BGRA' : '') + ') - showing it now');
-      if (msg.idx === msg.count - 1) this.pending = Math.max(0, this.pending - 1);   // the last reply of the set closes out this source frame
+      const isReal = msg.idx === msg.count - 1;   // the last reply of a set is the real (non-generated) frame, matching the source frame `msg.seq`
+      if (isReal) {
+        this.pending = Math.max(0, this.pending - 1);
+        this._logDiff(msg);
+      }
       const bgra = !!(msg.flags & 1);
       const delayMs = Math.max(0, (this.frameInterval / Math.max(1, msg.count)) * msg.idx);
       const draw = () => this._drawFrame(msg.w, msg.h, msg.buffer, bgra);
       if (delayMs < 2) draw(); else setTimeout(draw, delayMs);
+    }
+
+    // Objective yes/no answer to "is the pipeline actually changing the picture": mean absolute difference between the source frame this reply's `seq`
+    // was captured from and what came back for it, sampled every ~2s so it doesn't spam the console. ~0 = the bridge is returning the frame unchanged
+    // (DLSS5/frame generation aren't doing anything visible, or the picture on screen isn't actually this reply); a real value = it is processing frames -
+    // a subtle look on screen is then a matter of the settings/content, not a broken pipeline.
+    _logDiff(msg) {
+      if (!this._sourceCache) return;
+      const now = performance.now();
+      if (this._lastDiffLog && now - this._lastDiffLog < 2000) { this._sourceCache.delete(msg.seq); return; }
+      const src = this._sourceCache.get(msg.seq);
+      this._sourceCache.delete(msg.seq);
+      if (!src || src.length !== msg.buffer.byteLength) return;
+      this._lastDiffLog = now;
+      const out = new Uint8Array(msg.buffer.slice(0));
+      const bgra = !!(msg.flags & 1);
+      let sum = 0, n = 0;
+      for (let i = 0; i < out.length; i += 4 * 37) {   // sparse sample, plenty for a mean estimate, cheap
+        const r = bgra ? out[i + 2] : out[i], g = out[i + 1], b = bgra ? out[i] : out[i + 2];
+        sum += Math.abs(r - src[i]) + Math.abs(g - src[i + 1]) + Math.abs(b - src[i + 2]);
+        n += 3;
+      }
+      log('output vs source mean abs diff:', (sum / n).toFixed(2), '(0..255; ~0 means the pipeline is returning the frame unchanged)');
     }
 
     _drawFrame(w, h, buffer, bgra) {
