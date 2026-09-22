@@ -58,6 +58,7 @@ class Pipeline:
     def configure(self, cfg, src_w, src_h):
         self.cfg = cfg
         self.src_w, self.src_h = src_w, src_h
+        log(f"configure: src={src_w}x{src_h} dlss5={cfg.get('dlss5')} framegen={cfg.get('framegen')}")
         d = cfg.get("dlss5") or {}
         if d.get("enabled"):
             # Render at `scale` of the cropped size, reconstruct straight back up to src_w/src_h (full_w/full_h below) - DLSS5's own built-in upscale.
@@ -94,6 +95,8 @@ class Pipeline:
         elif self.fg is not None:
             self.fg.close()
             self.fg = self.fg_key = None
+
+        log(f"configure done: worker={'on ' + str(self.worker_key) if self.worker else 'off'} framegen={'on ' + str(self.fg_key) if self.fg else 'off'}")
 
     def process(self, rgba: np.ndarray):
         """One source frame -> list of (rgba_or_bgra, is_bgra, pts_ms) to send, in display order. Frame generation (if on) yields the generated frames first
