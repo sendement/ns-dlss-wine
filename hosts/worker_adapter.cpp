@@ -6,6 +6,7 @@
 //
 //   worker_adapter.exe MAX_W MAX_H MAX_OUT_W MAX_OUT_H IN OUT CTL [key=value ...]
 //     key=value: nr_preset=N (model-variant hint, read once at worker start), exe=NAME (worker binary, default nvngx.dll)
+//   WA_DEBUG=1 (env var): trace every pipe read/write to stderr (byte counts, magic numbers) - use with NS_WORKER_LOG=1 to also see the worker's own log.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdint>
@@ -55,7 +56,14 @@ static HANDLE g_childIn, g_childOutRead;   // pipes to/from the NeuralScreen wor
 static bool WritePipe(const void* p, size_t n) { DWORD w; return WriteFile(g_childIn, p, (DWORD)n, &w, nullptr) && w == n; }
 static bool ReadPipe(void* p, size_t n) {
     uint8_t* d = (uint8_t*)p; size_t got = 0;
-    while (got < n) { DWORD r; if (!ReadFile(g_childOutRead, d + got, (DWORD)(n - got), &r, nullptr) || r == 0) return false; got += r; }
+    const bool dbg = getenv("WA_DEBUG") != nullptr;
+    while (got < n) {
+        DWORD avail = 0; if (dbg) PeekNamedPipe(g_childOutRead, nullptr, 0, nullptr, &avail, nullptr);
+        DWORD r; bool ok = ReadFile(g_childOutRead, d + got, (DWORD)(n - got), &r, nullptr);
+        if (dbg) fprintf(stderr, "[worker-adapter] DEBUG ReadPipe want=%zu got=%zu avail_before=%lu readfile_ok=%d r=%lu\n", n, got, (unsigned long)avail, ok, (unsigned long)r);
+        if (!ok || r == 0) return false;
+        got += r;
+    }
     return true;
 }
 
@@ -130,7 +138,15 @@ int main(int argc, char** argv) {
                     if (!SpawnWorker(dir, exe.c_str(), opts)) { fail("could not start the worker process"); break; }
                 }
                 ok = InnerConfigure(first ? MAGIC_VIDEO : MAGIC_RESIZE, w, h, c->warmup, first ? 0 : c->flags, c, (ow != w || oh != h) ? ow : 0, (ow != w || oh != h) ? oh : 0, /*waitAck=*/!first, &code);
-                if (ok) { curW = w; curH = h; curOutW = ow; curOutH = oh; primed = true; frameIndex = 0; zeroMotion.assign((size_t)w * h * 4, 0); }
+                if (ok) {
+                    curW = w; curH = h; curOutW = ow; curOutH = oh; primed = true; frameIndex = 0;
+                    const bool reconstructing = (ow != w || oh != h);
+                    // The motion-vector plane must be sized to the RECONSTRUCTION TARGET (ow x oh), not the work size, whenever the worker reconstructs to
+                    // a larger output - sending it at the work size silently starves the worker of input bytes it's still waiting to read (its main
+                    // thread blocks in a plain pipe read; there is no error on either side, just a permanent stall on the very first frame).
+                    const size_t mvW = reconstructing ? ow : w, mvH = reconstructing ? oh : h;
+                    zeroMotion.assign(mvW * mvH * 4, 0);
+                }
             }
             c->out_w = curOutW; c->out_h = curOutH;
         } else if (!primed) {
@@ -144,12 +160,16 @@ int main(int argc, char** argv) {
             if (ok) {
                 for (;;) {
                     uint32_t m; if (!ReadPipe(&m, 4)) { ok = false; break; }
-                    if (m == MAGIC_OUT) { InnerOutRest r; if (!ReadPipe(&r, sizeof r)) { ok = false; break; } byteCount = r.byte_count; code = r.code; ok = r.ok != 0; break; }
+                    if (getenv("WA_DEBUG")) fprintf(stderr, "[worker-adapter] DEBUG reply magic=0x%08x\n", m);
+                    if (m == MAGIC_OUT) { InnerOutRest r; if (!ReadPipe(&r, sizeof r)) { ok = false; break; }
+                        if (getenv("WA_DEBUG")) fprintf(stderr, "[worker-adapter] DEBUG OUT reply: out_index=%u ok=%u byte_count=%u code=%u\n", r.out_index, r.ok, r.byte_count, r.code);
+                        byteCount = r.byte_count; code = r.code; ok = r.ok != 0; break; }
                     uint8_t skip[sizeof(InnerAckRest)]; if (!ReadPipe(skip, sizeof skip)) { ok = false; break; }   // some other reply of the ack shape; not ours here
                 }
             }
             if (ok && byteCount) ok = ReadPipe(out, byteCount);
             else ok = false;   // no frame produced this round (e.g. still priming temporal history) - not an error, just nothing to show
+            if (getenv("WA_DEBUG")) fprintf(stderr, "[worker-adapter] DEBUG frame %u final ok=%d byteCount=%u\n", frameIndex - 1, ok, byteCount);
         }
         c->code = code;
         MemoryBarrier(); c->ok = ok ? 1 : 0; c->ack_seq = next;

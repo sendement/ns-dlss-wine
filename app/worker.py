@@ -87,6 +87,10 @@ class Worker:
         self._seq = 0
         self.w, self.h, self.out_w, self.out_h = w, h, out_w0, out_h0
         self.last_write_ms = self.last_wait_ms = self.last_read_ms = 0.0
+        # The adapter does not wait for the underlying worker's own ack on the very first configure (docs/worker-protocol.md's "Reference adapter" section),
+        # so model loading (observed: several seconds) can surface as a slow reply to the first FRAME instead of to this configure - give that one frame a
+        # long timeout too, not just this call.
+        self._warming = True
         self._reconfigure(w, h, full_w, full_h, self.params, 0)
 
     def _u32(self, off):
@@ -134,7 +138,8 @@ class Worker:
         seq = self._seq + 1
         struct.pack_into("<I", self._ctl, _REQ_SEQ, seq)
         t1 = time.monotonic()
-        self._wait_ack(seq)
+        self._wait_ack(seq, timeout=_CONFIGURE_TIMEOUT_SEC if self._warming else _FRAME_TIMEOUT_SEC)
+        self._warming = False
         self._seq = seq
         t2 = time.monotonic()
         self.last_write_ms = (t1 - t0) * 1000

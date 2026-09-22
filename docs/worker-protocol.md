@@ -68,7 +68,15 @@ worker wire format on stdin/stdout to a child process (`nvngx.dll --live`, PolyF
 format was learned by reading the worker's source and is described here only as facts about the interface, not reproduced as code: a fixed-size
 header/resize command (magic, width, height, two mode-dependent fields, then the same seven tunables as above plus a width/height pair used only when the
 worker should reconstruct at a larger size than it was fed), a live resize command that reuses the header's exact layout and gets a small acknowledgement
-back, and a per-frame exchange of a small header followed by the raw pixel and (always-zero, in this project) motion-vector bytes, answered with a header
-followed by the raw output pixels. The child process is started lazily, on the first reconfigure - that is the first point at which its work/output sizes
-are known, and one of its start-only options depends on whether they differ. The adapter owns all of that; nothing upstream of it needs to know
-NeuralScreen exists. A different worker that speaks the open protocol directly needs no adapter and no Wine.
+back, and a per-frame exchange of a small header followed by the raw pixel and motion-vector bytes, answered with a header followed by the raw output
+pixels. The child process is started lazily, on the first reconfigure - that is the first point at which its work/output sizes are known, and one of its
+start-only options depends on whether they differ.
+
+**Motion-vector plane sizing when reconstructing.** When the worker is asked to reconstruct at a larger size than it was fed (the width/height pair above
+differs from the frame size), its per-frame motion-vector plane must be sized to that RECONSTRUCTION TARGET, not the work size the colour frame is sent
+at - sending it at the work size doesn't error on either side, it just leaves the worker's main thread blocked in a plain pipe read forever, waiting for
+input bytes that are never coming (found by tracing exactly where its thread was parked: `anon_pipe_read`, not any GPU wait - it costs 0% CPU while stuck,
+easy to mistake for a driver-level hang between unrelated GPU processes rather than a starved pipe read from this one).
+
+The adapter owns all of the above; nothing upstream of it needs to know NeuralScreen exists. A different worker that speaks the open protocol directly
+needs no adapter and no Wine.
