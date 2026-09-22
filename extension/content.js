@@ -258,6 +258,8 @@
       catch (e) { if (!this._readErrorLogged) { this._readErrorLogged = true; console.error('[ns-yt] cannot read the video frame (likely DRM-protected content):', e); } return; }
       this.seq++;
       this.pending++;
+      if (this.seq === 1) log('sending the first frame (' + c.sw + 'x' + c.sh + ') - a first DLSS5/frame-generation reply can take several seconds while its worker process starts up');
+      else if (this.seq % 60 === 0) log('sent', this.seq, 'frames, received', this.received || 0);
       this.port.postMessage({ type: 'frame', seq: this.seq, w: c.sw, h: c.sh, buffer: data.data.buffer }, [data.data.buffer]);
     }
 
@@ -275,6 +277,8 @@
     }
 
     _onOutput(msg) {
+      this.received = (this.received || 0) + 1;
+      if (this.received === 1) log('first processed frame received (' + msg.w + 'x' + msg.h + (msg.flags & 1 ? ', BGRA' : '') + ') - showing it now');
       if (msg.idx === msg.count - 1) this.pending = Math.max(0, this.pending - 1);   // the last reply of the set closes out this source frame
       const bgra = !!(msg.flags & 1);
       const delayMs = Math.max(0, (this.frameInterval / Math.max(1, msg.count)) * msg.idx);

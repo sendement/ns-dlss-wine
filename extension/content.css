@@ -8,7 +8,9 @@
 .nsyt-button.nsyt-active svg { fill: #3ea6ff; }
 
 /* ===== Result canvas (drawn over the hidden <video>) ===== */
-.nsyt-canvas { position: absolute; top: 0; left: 0; z-index: 30; pointer-events: none; display: block; background: #000; }
+/* No background colour: the real (still playing) video must stay visible through/under this canvas until the first processed frame actually arrives -
+   DLSS5 or frame generation can take several seconds to start on a cold Wine/NGX process; an opaque canvas would black the screen out for all of that. */
+.nsyt-canvas { position: absolute; top: 0; left: 0; z-index: 30; pointer-events: none; display: block; }
 
 /* ===== Position-adjustment overlay ===== */
 .nsyt-overlay {
