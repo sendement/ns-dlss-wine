@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
-// YouTube content script: crops the video to the player's aspect ratio (no black bars), then optionally runs it through DLSS5 and/or frame generation via
-// the local bridge (app/yt_bridge.py, through background.js). Crop geometry is centred (no manual position drag, unlike the sample this project started
-// from - see docs/development notes) - the point of this extension is the neural pipeline, not the cropping UI.
+// YouTube content script: crops the video to the player's aspect ratio (draggable position, like the sample this project's geometry/overlay code is based
+// on), then optionally runs it through DLSS5 and/or frame generation via the local bridge (app/yt_bridge.py, through background.js).
 //
 // Pipeline: crop (here, cheap) -> DLSS5 (own internal upscale, worker.py) -> frame generation (framegen/*). Either stage can be off; the frame flows
-// through unchanged. The result is drawn onto a canvas placed exactly over the (hidden) <video> element - see BridgeRenderer.
+// through unchanged. Settings are only sent to the bridge ONCE, when the position-adjustment overlay is confirmed - not live while dragging a slider: the
+// DLSS5 worker tears down and rebuilds its own process on a size change (seconds, not milliseconds - see docs/worker-protocol.md), so the settings panels
+// live inside that same overlay (closed = no renderer exists yet = nothing to reconfigure), exactly mirroring how the sample's own upscale-mode menus only
+// ever showed up during that same adjustment step.
 (function () {
   'use strict';
 
@@ -13,7 +15,6 @@
 
   const DEFAULT_WS_URL = 'ws://127.0.0.1:8765';
   const DEFAULT_SETTINGS = {
-    enabled: false,
     dlss5: { enabled: true, scale: 0.5, intensity: 1.0, local_tone: 1.0, local_structure: 1.0, skin_structure: -1.0, style: 1, auto_mask: 0, ui_correction: 0 },
     framegen: { enabled: false, method: 'dlssg', multiplier: 2 },
     wsUrl: DEFAULT_WS_URL,
@@ -28,13 +29,10 @@
   }
 
   const settings = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
-  const listeners = [];
-  function onSettingsChanged(fn) { listeners.push(fn); }
   function applySettings(raw) {
     Object.assign(settings, DEFAULT_SETTINGS, raw || {});
     settings.dlss5 = Object.assign({}, DEFAULT_SETTINGS.dlss5, (raw && raw.dlss5) || {});
     settings.framegen = Object.assign({}, DEFAULT_SETTINGS.framegen, (raw && raw.framegen) || {});
-    listeners.forEach((fn) => fn());
   }
   function persist() {
     const area = storageArea();
@@ -44,42 +42,52 @@
   function loadSettings() {
     const area = storageArea();
     if (!area) { log('no storage - defaults only'); return; }
-    try {
-      area.get('nsyt', (data) => { applySettings(data && data.nsyt); log('settings loaded'); });
-      chrome.storage.onChanged.addListener((changes) => { if (changes.nsyt) applySettings(changes.nsyt.newValue); });
-    } catch (e) { log('settings unavailable', e.message); }
+    try { area.get('nsyt', (data) => { applySettings(data && data.nsyt); log('settings loaded'); }); }
+    catch (e) { log('settings unavailable', e.message); }
   }
 
-  /* ============ Crop geometry (centred "cover": no black bars, no manual reposition) ============ */
+  // Remembers the crop between videos and fullscreen toggles - not persisted to storage (session-only, like the sample).
+  const memory = { enabled: false, suspended: false, ratio: null, posX: 50, posY: 50 };
 
-  function findVideo(player) {
-    return player.querySelector('video.html5-main-video') || player.querySelector('video');
-  }
-  function findContainer(player) {
-    return player.querySelector('.html5-video-container');
-  }
-  function playerSize(player) {
-    const r = player.getBoundingClientRect();
-    return { Cw: Math.round(r.width), Ch: Math.round(r.height) };
-  }
+  const PREVIEW_FIT = 0.85;   // how much the video is shrunk in adjust mode so the whole frame (incl. the parts that will be cropped) is visible
+
+  /* ============ Crop geometry (centred "cover" + draggable offset - same math as the sample) ============ */
+
+  function findVideo(player) { return player.querySelector('video.html5-main-video') || player.querySelector('video'); }
+  function findContainer(player) { return player.querySelector('.html5-video-container'); }
+  function playerSize(player) { const r = player.getBoundingClientRect(); return { Cw: Math.round(r.width), Ch: Math.round(r.height) }; }
   function ratioKey(video) {
     if (!video || !video.videoWidth || !video.videoHeight) return null;
     return Math.round((video.videoWidth / video.videoHeight) * 100) / 100;
   }
-  // The crop rectangle in the VIDEO's own native pixels, centred, matching the player's own aspect ratio - the same "cover" math as the sample extension.
-  function computeSourceCrop(player) {
+
+  // Full geometry: the cover size (no black bars), how far it overhangs the player box, and the preview scale.
+  function computeGeom(player) {
     const video = findVideo(player);
-    if (!video || !video.videoWidth) return null;
+    if (!video || !video.videoWidth || !video.videoHeight) return null;
     const { Cw, Ch } = playerSize(player);
     if (!Cw || !Ch) return null;
+    const videoRatio = video.videoWidth / video.videoHeight, containerRatio = Cw / Ch;
+    let coverW, coverH;
+    if (videoRatio > containerRatio) { coverH = Ch; coverW = Ch * videoRatio; } else { coverW = Cw; coverH = Cw / videoRatio; }
+    const slackW = Math.max(0, coverW - Cw), slackH = Math.max(0, coverH - Ch);
+    const k = PREVIEW_FIT * Math.min(Cw / coverW, Ch / coverH);
+    return { Cw, Ch, coverW, coverH, slackW, slackH, k, canX: slackW > 1, canY: slackH > 1 };
+  }
+
+  // The crop rectangle in the VIDEO's own native pixels, at the given position (0..100, 50 = centred).
+  function computeSourceCrop(player, posX, posY) {
+    const video = findVideo(player);
+    const geom = computeGeom(player);
+    if (!video || !geom) return null;
     const vw = video.videoWidth, vh = video.videoHeight;
-    const containerRatio = Cw / Ch, videoRatio = vw / vh;
+    const containerRatio = geom.Cw / geom.Ch, videoRatio = vw / vh;
     let sw, sh, sx, sy;
-    if (videoRatio > containerRatio) { sh = vh; sw = vh * containerRatio; sx = (vw - sw) / 2; sy = 0; }
-    else { sw = vw; sh = vw / containerRatio; sx = 0; sy = (vh - sh) / 2; }
+    if (videoRatio > containerRatio) { sh = vh; sw = vh * containerRatio; sx = (vw - sw) * (posX / 100); sy = 0; }
+    else { sw = vw; sh = vw / containerRatio; sx = 0; sy = (vh - sh) * (posY / 100); }
     // even dimensions: the DLSS5/frame-generation backends require them
     sw = Math.max(2, Math.floor(sw / 2) * 2); sh = Math.max(2, Math.floor(sh / 2) * 2);
-    return { Cw, Ch, sx: Math.round(sx), sy: Math.round(sy), sw, sh };
+    return { Cw: geom.Cw, Ch: geom.Ch, sx: Math.round(sx), sy: Math.round(sy), sw, sh };
   }
 
   const VIDEO_PROPS = ['position', 'top', 'left', 'width', 'height', 'object-fit', 'object-position', 'transform', 'max-width', 'max-height'];
@@ -95,89 +103,78 @@
   }
 
   function isFullscreen() { return !!(document.fullscreenElement || document.webkitFullscreenElement); }
+  function shouldBeActive(player) { return memory.enabled && !memory.suspended && ratioKey(findVideo(player)) !== null && Math.abs(ratioKey(findVideo(player)) - memory.ratio) < 0.02; }
 
   const STATE = new WeakMap();
   function getState(player) {
     let s = STATE.get(player);
-    if (!s) { s = { active: false, origVideoStyle: null, origContainerStyle: null, renderer: null, resizeObserver: null, reassertTimer: null }; STATE.set(player, s); }
+    if (!s) {
+      s = { zoomed: false, adjusting: false, posX: 50, posY: 50, origVideoStyle: null, origContainerStyle: null,
+            resizeObserver: null, reassertTimer: null, renderer: null, overlay: null };
+      STATE.set(player, s);
+    }
     return s;
   }
 
+  // Pixel-exact layout (percentages resolve against the wrong box during YouTube's own transitions - see the sample this is based on).
   function applyLayout(player, s) {
     const video = findVideo(player);
-    const crop = computeSourceCrop(player);
-    if (!video || !crop) return false;
+    const geom = computeGeom(player);
+    if (!video || !geom) return false;
     const container = findContainer(player);
+    const { Cw, Ch } = geom;
     if (container) {
       container.style.setProperty('position', 'absolute', 'important');
       container.style.setProperty('top', '0px', 'important');
       container.style.setProperty('left', '0px', 'important');
-      container.style.setProperty('width', crop.Cw + 'px', 'important');
-      container.style.setProperty('height', crop.Ch + 'px', 'important');
+      container.style.setProperty('width', Cw + 'px', 'important');
+      container.style.setProperty('height', Ch + 'px', 'important');
       container.style.setProperty('overflow', 'hidden', 'important');
     }
+    let w, h, left, top, fit, objPos;
+    if (s.adjusting) {
+      w = Math.round(geom.coverW * geom.k); h = Math.round(geom.coverH * geom.k);
+      const offsetX = (0.5 - s.posX / 100) * geom.slackW * geom.k, offsetY = (0.5 - s.posY / 100) * geom.slackH * geom.k;
+      left = Math.round((Cw - w) / 2 + offsetX); top = Math.round((Ch - h) / 2 + offsetY);
+      fit = 'fill'; objPos = '50% 50%';
+    } else {
+      w = Cw; h = Ch; left = 0; top = 0; fit = 'cover'; objPos = `${s.posX}% ${s.posY}%`;
+    }
     video.style.setProperty('position', 'absolute', 'important');
-    video.style.setProperty('left', '0px', 'important');
-    video.style.setProperty('top', '0px', 'important');
-    video.style.setProperty('width', crop.Cw + 'px', 'important');
-    video.style.setProperty('height', crop.Ch + 'px', 'important');
+    video.style.setProperty('left', left + 'px', 'important');
+    video.style.setProperty('top', top + 'px', 'important');
+    video.style.setProperty('width', w + 'px', 'important');
+    video.style.setProperty('height', h + 'px', 'important');
     video.style.setProperty('max-width', 'none', 'important');
     video.style.setProperty('max-height', 'none', 'important');
-    video.style.setProperty('object-fit', 'cover', 'important');
-    video.style.setProperty('object-position', '50% 50%', 'important');
+    video.style.setProperty('object-fit', fit, 'important');
+    video.style.setProperty('object-position', objPos, 'important');
     video.style.setProperty('transform', 'none', 'important');
-    if (s.renderer) s.renderer.layout(crop);
+    if (s.zoomed && !s.adjusting && s.renderer) {
+      const crop = computeSourceCrop(player, s.posX, s.posY);
+      if (crop) s.renderer.layout(crop);
+    }
     return true;
+  }
+
+  function verifyLayout(player) {
+    const video = findVideo(player);
+    if (!video) return false;
+    const r = video.getBoundingClientRect();
+    return r.width >= 10 && r.height >= 10;
   }
 
   function startWatchers(player, s) {
     stopWatchers(s);
     if (typeof ResizeObserver !== 'undefined') {
-      s.resizeObserver = new ResizeObserver(() => { if (s.active) applyLayout(player, s); });
+      s.resizeObserver = new ResizeObserver(() => { if (s.adjusting || s.zoomed) { applyLayout(player, s); syncOverlayFrame(player); } });
       s.resizeObserver.observe(player);
     }
-    s.reassertTimer = setInterval(() => { if (!s.active) return stopWatchers(s); applyLayout(player, s); }, 500);
+    s.reassertTimer = setInterval(() => { if (!s.adjusting && !s.zoomed) return stopWatchers(s); applyLayout(player, s); }, 500);
   }
   function stopWatchers(s) {
     if (s.resizeObserver) { s.resizeObserver.disconnect(); s.resizeObserver = null; }
     if (s.reassertTimer) { clearInterval(s.reassertTimer); s.reassertTimer = null; }
-  }
-
-  function turnOn(player) {
-    const s = getState(player);
-    if (s.active) return;
-    const video = findVideo(player);
-    if (!video || !video.videoWidth) return;
-    s.origVideoStyle = snapshotStyle(video, VIDEO_PROPS);
-    const container = findContainer(player);
-    if (container) s.origContainerStyle = snapshotStyle(container, CONTAINER_PROPS);
-    s.active = true;
-    s.renderer = new BridgeRenderer(player, video);
-    if (!applyLayout(player, s)) { turnOff(player); return; }
-    s.renderer.start();
-    startWatchers(player, s);
-    toggleButtonActive(player, true);
-    log('turned on');
-  }
-
-  function turnOff(player) {
-    const s = getState(player);
-    if (s.renderer) { s.renderer.destroy(); s.renderer = null; }
-    stopWatchers(s);
-    s.active = false;
-    const video = findVideo(player);
-    if (video) video.style.removeProperty('opacity');
-    restoreStyle(video, s.origVideoStyle);
-    restoreStyle(findContainer(player), s.origContainerStyle);
-    s.origVideoStyle = s.origContainerStyle = null;
-    toggleButtonActive(player, false);
-    window.dispatchEvent(new Event('resize'));
-    log('turned off');
-  }
-
-  function toggleButtonActive(player, on) {
-    const btn = player.querySelector('.nsyt-button');
-    if (btn) btn.classList.toggle('nsyt-active', on);
   }
 
   /* ============ BridgeRenderer: captures video frames, talks to background.js, draws the result back ============ */
@@ -189,7 +186,7 @@
       this.running = false;
       this.crop = null;
       this.seq = 0;
-      this.pending = 0;           // frames sent but not yet fully answered - back-pressure (the bridge pipeline is 1-in-flight per docs/worker-protocol.md)
+      this.pending = 0;           // frames sent but not yet fully answered - back-pressure (the bridge answers one source frame at a time)
       this.frameInterval = 1000 / 30;
       this.lastArrival = 0;
 
@@ -204,7 +201,6 @@
       this.port = chrome.runtime.connect({ name: 'ns-yt' });
       this.port.onMessage.addListener((msg) => this._onMessage(msg));
       this.port.onDisconnect.addListener(() => log('port disconnected'));
-      this._configured = false;
     }
 
     layout(crop) {
@@ -222,12 +218,12 @@
 
     _sendConfigure() {
       if (!this.crop) return;
+      log('configuring pipeline:', this.crop.sw + 'x' + this.crop.sh, settings.dlss5, settings.framegen);
       this.port.postMessage({
         type: 'configure',
         wsUrl: settings.wsUrl || DEFAULT_WS_URL,
         config: { type: 'config', src_w: this.crop.sw, src_h: this.crop.sh, dlss5: settings.dlss5, framegen: settings.framegen },
       });
-      this._configured = true;
     }
 
     start() {
@@ -248,7 +244,7 @@
     _tick() {
       const v = this.video;
       if (!this.crop || !v || v.readyState < 2 || v.paused || v.seeking) return;
-      if (this.pending >= 2) return;   // the bridge answers strictly in order, one (plus one in flight) at a time - drop this tick's frame rather than pile up
+      if (this.pending >= 2) return;   // the bridge answers strictly in order - drop this tick's frame rather than pile up
       const now = performance.now();
       if (this.lastArrival) {
         const dt = now - this.lastArrival;
@@ -268,9 +264,10 @@
     _onMessage(msg) {
       switch (msg.type) {
         case 'ws_open': log('bridge connected'); break;
-        case 'ws_error': console.warn('[ns-yt]', msg.message); break;
-        case 'ws_closed': log('bridge disconnected'); break;
+        case 'ws_error': console.warn('[ns-yt]', msg.message); this.pending = 0; break;
+        case 'ws_closed': log('bridge disconnected'); this.pending = 0; break;
         case 'config_ack':
+          log('config_ack', msg.ok ? 'ok' : 'REJECTED: ' + msg.error);
           if (!msg.ok) console.warn('[ns-yt] pipeline configuration rejected:', msg.error);
           break;
         case 'output': this._onOutput(msg); break;
@@ -290,10 +287,8 @@
       if (bgra) { for (let i = 0; i + 2 < u8.length; i += 4) { const b = u8[i]; u8[i] = u8[i + 2]; u8[i + 2] = b; } }
       if (this.display.width !== w || this.display.height !== h) { this.display.width = w; this.display.height = h; }
       this.displayCtx.putImageData(new ImageData(u8, w, h), 0, 0);
-      if (this.video.style.opacity !== '0') this.video.style.setProperty('opacity', '0', 'important');   // keep decoding, just hide - matches the sample's approach
+      if (this.video.style.opacity !== '0') this.video.style.setProperty('opacity', '0', 'important');   // keep decoding, just hide
     }
-
-    reconfigure() { this._sendConfigure(); }
 
     destroy() {
       this.running = false;
@@ -304,11 +299,107 @@
     }
   }
 
-  /* ============ UI: fill button + two settings panels (DLSS5, FrameGen) ============ */
+  /* ============ on/off/adjust state machine (mirrors the sample: click = adjust position + pick settings, confirm = apply, click again = off) ============ */
+
+  function turnOff(player, keepMemory) {
+    const s = getState(player);
+    if (s.renderer) { s.renderer.destroy(); s.renderer = null; }
+    const video = findVideo(player);
+    if (video) video.style.removeProperty('opacity');
+    if (!keepMemory) { memory.enabled = false; memory.suspended = false; }
+    stopWatchers(s);
+    s.zoomed = false; s.adjusting = false; s.posX = 50; s.posY = 50;
+    removeOverlay(player);
+    restoreStyle(video, s.origVideoStyle);
+    restoreStyle(findContainer(player), s.origContainerStyle);
+    s.origVideoStyle = s.origContainerStyle = null;
+    toggleButtonActive(player, false);
+    window.dispatchEvent(new Event('resize'));
+    log('turned off');
+  }
+
+  function startAdjust(player) {
+    const video = findVideo(player);
+    if (!video || !video.videoWidth || !video.videoHeight) return;
+    const geom = computeGeom(player);
+    if (!geom) return;
+    const s = getState(player);
+    s.origVideoStyle = snapshotStyle(video, VIDEO_PROPS);
+    const container = findContainer(player);
+    if (container) s.origContainerStyle = snapshotStyle(container, CONTAINER_PROPS);
+    s.posX = 50; s.posY = 50; s.adjusting = true;
+    if (!applyLayout(player, s) || !verifyLayout(player)) { turnOff(player); return; }
+    buildOverlay(player, s, geom);
+    startWatchers(player, s);
+  }
+
+  function confirmAdjust(player) {
+    const s = getState(player);
+    s.adjusting = false; s.zoomed = true;
+    removeOverlay(player);
+    applyLayout(player, s);
+    if (!verifyLayout(player)) { turnOff(player); return; }
+    memory.enabled = true; memory.suspended = false;
+    memory.ratio = ratioKey(findVideo(player)); memory.posX = s.posX; memory.posY = s.posY;
+    const crop = computeSourceCrop(player, s.posX, s.posY);
+    s.renderer = new BridgeRenderer(player, findVideo(player));
+    if (crop) s.renderer.layout(crop);
+    s.renderer.start();
+    toggleButtonActive(player, true);
+    log('confirmed', { posX: s.posX, posY: s.posY, crop });
+  }
+
+  function cancelAdjust(player) { getState(player).adjusting = false; turnOff(player, true); }
+
+  function applyRemembered(player) {
+    const video = findVideo(player);
+    if (!video || !video.videoWidth || !video.videoHeight) return false;
+    const s = getState(player);
+    if (s.zoomed || s.adjusting) return false;
+    if (!s.origVideoStyle) {
+      s.origVideoStyle = snapshotStyle(video, VIDEO_PROPS);
+      const container = findContainer(player);
+      if (container) s.origContainerStyle = snapshotStyle(container, CONTAINER_PROPS);
+    }
+    s.posX = memory.posX; s.posY = memory.posY; s.adjusting = false; s.zoomed = true;
+    if (!applyLayout(player, s) || !verifyLayout(player)) { turnOff(player, true); return false; }
+    memory.ratio = memory.ratio ?? ratioKey(video);
+    const crop = computeSourceCrop(player, s.posX, s.posY);
+    s.renderer = new BridgeRenderer(player, video);
+    if (crop) s.renderer.layout(crop);
+    s.renderer.start();
+    toggleButtonActive(player, true);
+    startWatchers(player, s);
+    return true;
+  }
+
+  function syncPlayer(player) {
+    const s = getState(player);
+    if (s.adjusting) return;
+    if (shouldBeActive(player)) { if (!s.zoomed) applyRemembered(player); }
+    else if (s.zoomed) turnOff(player, true);
+  }
+
+  function toggleButtonActive(player, on) {
+    const btn = player.querySelector('.nsyt-button');
+    if (btn) btn.classList.toggle('nsyt-active', on);
+  }
+
+  function onButtonClick(player) {
+    const s = getState(player);
+    if (s.adjusting) return;
+    if (s.zoomed) turnOff(player); else startAdjust(player);
+  }
+
+  /* ============ Adjustment overlay: drag-to-position + apply/cancel + the DLSS5/frame-generation settings menus ============ */
 
   const ICON_BUTTON = '<svg viewBox="0 0 24 24"><path d="M4 9V4h5v2H6v3H4zm16 0V4h-5v2h3v3h2zM4 15v5h5v-2H6v-3H4zm16 0v5h-5v-2h3v-3h2z"/></svg>';
+  const ICON_CHECK = '<svg viewBox="0 0 24 24"><path d="M9 16.2l-3.5-3.5-1.4 1.4L9 19 20 8l-1.4-1.4z"/></svg>';
+  const ICON_CROSS = '<svg viewBox="0 0 24 24"><path d="M18.3 5.7L12 12l6.3 6.3-1.4 1.4L10.6 13.4 4.3 19.7l-1.4-1.4L9.2 12 2.9 5.7l1.4-1.4 6.3 6.3 6.3-6.3z"/></svg>';
 
-  function slider(container, label, key, obj, min, max, step, onChange) {
+  function clamp(v, min, max) { return Math.min(max, Math.max(min, v)); }
+
+  function sliderRow(container, label, key, obj, min, max, step) {
     const row = document.createElement('div'); row.className = 'nsyt-row';
     const lab = document.createElement('span'); lab.className = 'nsyt-row-label'; lab.textContent = label;
     const val = document.createElement('span'); val.className = 'nsyt-row-val';
@@ -316,134 +407,182 @@
     input.type = 'range'; input.min = String(min); input.max = String(max); input.step = String(step); input.value = String(obj[key]);
     const fmt = (v) => (step < 1 ? Number(v).toFixed(2) : String(Math.round(v)));
     val.textContent = fmt(obj[key]);
-    input.addEventListener('input', () => { obj[key] = parseFloat(input.value); val.textContent = fmt(input.value); onChange(); });
+    input.addEventListener('input', () => { obj[key] = parseFloat(input.value); val.textContent = fmt(input.value); persist(); });
     row.appendChild(lab); row.appendChild(input); row.appendChild(val);
     container.appendChild(row);
-    return { input, val, refresh: () => { input.value = String(obj[key]); val.textContent = fmt(obj[key]); } };
   }
 
-  function checkbox(container, label, key, obj, onChange) {
+  function checkboxRow(container, label, key, obj, onChange) {
     const row = document.createElement('label'); row.className = 'nsyt-row nsyt-row-check';
     const input = document.createElement('input'); input.type = 'checkbox'; input.checked = !!obj[key];
-    input.addEventListener('change', () => { obj[key] = input.checked; onChange(); });
+    input.addEventListener('change', () => { obj[key] = input.checked; persist(); if (onChange) onChange(); });
     const lab = document.createElement('span'); lab.textContent = label;
     row.appendChild(input); row.appendChild(lab);
     container.appendChild(row);
-    return { input, refresh: () => { input.checked = !!obj[key]; } };
   }
 
-  // A button that opens a dropdown panel of arbitrary controls (checkbox + sliders), styled like the fill button's own menus.
-  // Panels are appended to <body> (see below), independent of the player element that owns their trigger button - pruneOrphanPanels() sweeps up ones
-  // whose button fell out of the document (YouTube's SPA navigation tears down and rebuilds the controls row between videos).
-  const allPanels = [];
-  function pruneOrphanPanels() {
-    for (let i = allPanels.length - 1; i >= 0; i--) {
-      if (!allPanels[i].btn.isConnected) { allPanels[i].panel.remove(); allPanels.splice(i, 1); }
-    }
+  // A round pill button with a menu that drops UP from it, nested (not body-fixed) - safe here because the overlay it lives in is a plain absolutely
+  // positioned div over the whole player, not clipped the way YouTube's own control row can be.
+  function buildSettingsMenu(title, buildContent, openMenus) {
+    const wrap = document.createElement('div'); wrap.className = 'nsyt-menu-wrap';
+    const btn = document.createElement('button'); btn.className = 'nsyt-menu-btn'; btn.textContent = title;
+    const menu = document.createElement('div'); menu.className = 'nsyt-menu'; menu.hidden = true;
+    buildContent(menu);
+    const close = () => { menu.hidden = true; btn.classList.remove('nsyt-open'); };
+    const open = () => { openMenus.forEach((fn) => fn()); menu.hidden = false; btn.classList.add('nsyt-open'); };
+    openMenus.push(close);
+    btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); menu.hidden ? open() : close(); });
+    wrap.appendChild(menu); wrap.appendChild(btn);
+    return { wrap, setOn: (on) => btn.classList.toggle('nsyt-on', on) };
   }
 
-  // The trigger button lives inline in the player's own control row (.ytp-right-controls) - see buildPanelButtons(). The dropdown itself is appended to
-  // <body> as position:fixed, anchored to the button's on-screen rect, NOT nested under it: YouTube's control bar clips overflowing children on some
-  // layouts, which would hide a CSS-relative dropdown even though the trigger button itself is visible.
-  function buildPanel(label, buildContent) {
-    const wrap = document.createElement('div'); wrap.className = 'nsyt-panel-wrap';
-    const btn = document.createElement('button'); btn.className = 'ytp-button nsyt-panel-btn'; btn.textContent = label;
-    const panel = document.createElement('div'); panel.className = 'nsyt-panel'; panel.hidden = true;
-    const refreshers = [];
-    buildContent(panel, (r) => refreshers.push(r));
-    document.body.appendChild(panel);
-    allPanels.push({ btn, panel });
+  function buildOverlay(player, s, geom) {
+    removeOverlay(player);
+    const overlay = document.createElement('div'); overlay.className = 'nsyt-overlay';
 
-    const reposition = () => {
-      const r = btn.getBoundingClientRect();
-      panel.style.left = Math.round(Math.min(r.left, window.innerWidth - panel.offsetWidth - 8)) + 'px';
-      panel.style.top = Math.round(r.top - panel.offsetHeight - 6) + 'px';
-    };
-    const close = () => { panel.hidden = true; btn.classList.remove('nsyt-open'); };
-    const open = () => { refreshers.forEach((r) => r.refresh && r.refresh()); panel.hidden = false; btn.classList.add('nsyt-open'); reposition(); };
-    btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); panel.hidden ? open() : close(); });
-    panel.addEventListener('click', (e) => e.stopPropagation());
-    wrap.appendChild(btn);
-    return { wrap, btn, panel, close, setOn: (on) => btn.classList.toggle('nsyt-on', on) };
-  }
+    const frame = document.createElement('div'); frame.className = 'nsyt-frame'; overlay.appendChild(frame);
 
-  // The two panel buttons go into the SAME row as the fill button (.ytp-right-controls) - not a separate bar floating over the video, which the player's
-  // own chrome (or our own result canvas) can end up stacked over.
-  function buildPanelButtons(player) {
-    const applyAndPersist = (renderer) => { persist(); if (renderer) renderer.reconfigure(); };
-    const currentRenderer = () => { const s = STATE.get(player); return s && s.renderer; };
+    const hint = document.createElement('div'); hint.className = 'nsyt-hint';
+    hint.textContent = geom.canX && geom.canY ? 'Перетащите видео: затемнённое будет обрезано'
+      : geom.canX ? 'Двигайте влево/вправо: затемнённое будет обрезано'
+      : geom.canY ? 'Двигайте вверх/вниз: затемнённое будет обрезано'
+      : 'Пропорции совпадают — обрезка не требуется, нажмите ✓';
+    overlay.appendChild(hint);
 
-    const dlss5Panel = buildPanel('DLSS5', (panel, track) => {
-      track(checkbox(panel, 'Включено', 'enabled', settings.dlss5, () => { applyAndPersist(currentRenderer()); dlss5Panel.setOn(settings.dlss5.enabled); }));
-      track(slider(panel, 'Разрешение', 'scale', settings.dlss5, 0.25, 1.0, 0.05, () => applyAndPersist(currentRenderer())));
-      track(slider(panel, 'Интенсивность', 'intensity', settings.dlss5, 0, 2, 0.05, () => applyAndPersist(currentRenderer())));
-      track(slider(panel, 'Локальный тон', 'local_tone', settings.dlss5, 0, 2, 0.05, () => applyAndPersist(currentRenderer())));
-      track(slider(panel, 'Локальная структура', 'local_structure', settings.dlss5, 0, 2, 0.05, () => applyAndPersist(currentRenderer())));
-      track(slider(panel, 'Структура кожи', 'skin_structure', settings.dlss5, -1, 1, 0.05, () => applyAndPersist(currentRenderer())));
-      track(checkbox(panel, 'Авто-маска', 'auto_mask', settings.dlss5, () => applyAndPersist(currentRenderer())));
+    const controlsWrap = document.createElement('div'); controlsWrap.className = 'nsyt-controls';
+
+    const openMenus = [];
+    const dlss5Menu = buildSettingsMenu('DLSS5', (menu) => {
+      checkboxRow(menu, 'Включено', 'enabled', settings.dlss5, () => dlss5Menu.setOn(settings.dlss5.enabled));
+      sliderRow(menu, 'Разрешение', 'scale', settings.dlss5, 0.25, 1.0, 0.05);
+      sliderRow(menu, 'Интенсивность', 'intensity', settings.dlss5, 0, 2, 0.05);
+      sliderRow(menu, 'Локальный тон', 'local_tone', settings.dlss5, 0, 2, 0.05);
+      sliderRow(menu, 'Локальная структура', 'local_structure', settings.dlss5, 0, 2, 0.05);
+      sliderRow(menu, 'Структура кожи', 'skin_structure', settings.dlss5, -1, 1, 0.05);
+      checkboxRow(menu, 'Авто-маска', 'auto_mask', settings.dlss5);
+    }, openMenus);
+    const fgMenu = buildSettingsMenu('Кадры', (menu) => {
+      checkboxRow(menu, 'Включено', 'enabled', settings.framegen, () => fgMenu.setOn(settings.framegen.enabled));
+      sliderRow(menu, 'Множитель', 'multiplier', settings.framegen, 2, 4, 1);
+    }, openMenus);
+    dlss5Menu.setOn(settings.dlss5.enabled);
+    fgMenu.setOn(settings.framegen.enabled);
+
+    const applyBtn = document.createElement('button'); applyBtn.className = 'nsyt-apply'; applyBtn.innerHTML = ICON_CHECK; applyBtn.title = 'Применить';
+    applyBtn.addEventListener('click', (e) => { e.stopPropagation(); confirmAdjust(player); });
+    const cancelBtn = document.createElement('button'); cancelBtn.className = 'nsyt-cancel'; cancelBtn.innerHTML = ICON_CROSS; cancelBtn.title = 'Отмена';
+    cancelBtn.addEventListener('click', (e) => { e.stopPropagation(); cancelAdjust(player); });
+
+    overlay.addEventListener('pointerdown', (e) => { if (!controlsWrap.contains(e.target)) openMenus.forEach((fn) => fn()); }, true);
+
+    controlsWrap.appendChild(dlss5Menu.wrap);
+    controlsWrap.appendChild(fgMenu.wrap);
+    controlsWrap.appendChild(applyBtn);
+    controlsWrap.appendChild(cancelBtn);
+    overlay.appendChild(controlsWrap);
+
+    let dragging = false, startX = 0, startY = 0, startPosX = 50, startPosY = 50, live = geom;
+    overlay.addEventListener('pointerdown', (e) => {
+      if (e.target !== overlay) return;
+      live = computeGeom(player) || live;
+      dragging = true;
+      overlay.classList.add('nsyt-dragging');
+      overlay.setPointerCapture(e.pointerId);
+      startX = e.clientX; startY = e.clientY; startPosX = s.posX; startPosY = s.posY;
     });
-    const fgPanel = buildPanel('Кадры', (panel, track) => {
-      track(checkbox(panel, 'Включено', 'enabled', settings.framegen, () => { applyAndPersist(currentRenderer()); fgPanel.setOn(settings.framegen.enabled); }));
-      track(slider(panel, 'Множитель', 'multiplier', settings.framegen, 2, 4, 1, () => applyAndPersist(currentRenderer())));
+    overlay.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const dx = e.clientX - startX, dy = e.clientY - startY;
+      if (live.canX) s.posX = clamp(startPosX - (dx / (live.slackW * live.k)) * 100, 0, 100);
+      if (live.canY) s.posY = clamp(startPosY - (dy / (live.slackH * live.k)) * 100, 0, 100);
+      applyLayout(player, s);
     });
-    dlss5Panel.setOn(settings.dlss5.enabled);
-    fgPanel.setOn(settings.framegen.enabled);
+    const endDrag = () => { if (dragging) { dragging = false; overlay.classList.remove('nsyt-dragging'); } };
+    overlay.addEventListener('pointerup', endDrag);
+    overlay.addEventListener('pointercancel', endDrag);
+    overlay.addEventListener('pointerleave', endDrag);
+    overlay.addEventListener('click', (e) => e.stopPropagation());
+    overlay.addEventListener('dblclick', (e) => e.stopPropagation());
 
-    document.addEventListener('pointerdown', (e) => {
-      if (!dlss5Panel.wrap.contains(e.target) && !dlss5Panel.panel.contains(e.target)) dlss5Panel.close();
-      if (!fgPanel.wrap.contains(e.target) && !fgPanel.panel.contains(e.target)) fgPanel.close();
-    }, true);
-    return [dlss5Panel.wrap, fgPanel.wrap];
+    player.appendChild(overlay);
+    s.overlay = overlay;
+    syncOverlayFrame(player);
   }
+
+  function syncOverlayFrame(player) {
+    const overlay = player.querySelector('.nsyt-overlay');
+    if (!overlay) return;
+    const frame = overlay.querySelector('.nsyt-frame');
+    const geom = computeGeom(player);
+    if (!frame || !geom) return;
+    const w = Math.round(geom.Cw * geom.k), h = Math.round(geom.Ch * geom.k);
+    frame.style.width = w + 'px'; frame.style.height = h + 'px';
+    frame.style.left = Math.round((geom.Cw - w) / 2) + 'px'; frame.style.top = Math.round((geom.Ch - h) / 2) + 'px';
+  }
+
+  function removeOverlay(player) {
+    const existing = player.querySelector('.nsyt-overlay');
+    if (existing) existing.remove();
+  }
+
+  /* ============ Player button + lifecycle wiring ============ */
 
   function ensureButton(player) {
     const controls = player.querySelector('.ytp-right-controls');
     if (!controls || controls.querySelector('.nsyt-button')) return;
-
     const btn = document.createElement('button');
     btn.className = 'ytp-button nsyt-button';
     btn.title = 'DLSS5 / генерация кадров';
     btn.innerHTML = ICON_BUTTON;
-    btn.addEventListener('click', (e) => {
-      e.preventDefault(); e.stopPropagation();
-      const s = getState(player);
-      s.active ? turnOff(player) : turnOn(player);
-    });
+    btn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); onButtonClick(player); });
     controls.insertBefore(btn, controls.firstChild);
-    // panel buttons to the LEFT of the fill button, same row, same order every time: [DLSS5] [Кадры] [fill]
-    buildPanelButtons(player).reverse().forEach((wrap) => controls.insertBefore(wrap, btn));
-
     updateButtonVisibility(player);
   }
 
   function updateButtonVisibility(player) {
-    const show = isFullscreen();
-    player.querySelectorAll('.nsyt-button, .nsyt-panel-wrap').forEach((el) => { el.style.display = show ? '' : 'none'; });
-    if (!show) document.querySelectorAll('.nsyt-panel').forEach((p) => { p.hidden = true; });   // panels live on <body> (see buildPanel), not under player
+    const btn = player.querySelector('.nsyt-button');
+    if (btn) btn.style.display = isFullscreen() ? '' : 'none';
   }
 
   function eachPlayer(fn) { document.querySelectorAll('.html5-video-player').forEach(fn); }
-
-  function init() { eachPlayer((player) => ensureButton(player)); }
+  function init() { eachPlayer((player) => { ensureButton(player); updateButtonVisibility(player); watchVideoMetadata(player); }); }
 
   const observer = new MutationObserver(() => init());
   observer.observe(document.documentElement, { childList: true, subtree: true });
 
   document.addEventListener('yt-navigate-finish', () => {
     init();
-    eachPlayer((player) => { const s = STATE.get(player); if (s && s.active) turnOff(player); });
-    pruneOrphanPanels();
+    eachPlayer((player) => {
+      const s = STATE.get(player);
+      if (s && s.adjusting) cancelAdjust(player);
+      else if (s && s.zoomed) turnOff(player, true);
+      watchVideoMetadata(player);
+    });
   });
 
   function onFullscreenChange() {
+    const fs = isFullscreen();
+    if (!fs) { if (memory.enabled) memory.suspended = true; } else { memory.suspended = false; }
     eachPlayer((player) => {
       updateButtonVisibility(player);
       const s = STATE.get(player);
-      if (!isFullscreen() && s && s.active) turnOff(player);
+      if (s && s.adjusting) cancelAdjust(player);
+      syncPlayer(player);
+      setTimeout(() => { const st = STATE.get(player); if (st && st.zoomed) applyLayout(player, st); }, 120);
     });
   }
   document.addEventListener('fullscreenchange', onFullscreenChange);
   document.addEventListener('webkitfullscreenchange', onFullscreenChange);
+
+  function watchVideoMetadata(player) {
+    const video = findVideo(player);
+    if (!video || video.dataset.nsytBound === '1') return;
+    video.dataset.nsytBound = '1';
+    const onReady = () => syncPlayer(player);
+    video.addEventListener('loadedmetadata', onReady);
+    video.addEventListener('canplay', onReady);
+    video.addEventListener('resize', onReady);
+  }
 
   loadSettings();
   init();

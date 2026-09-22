@@ -1,50 +1,97 @@
 /* SPDX-License-Identifier: MIT */
 
+/* ===== Player button ===== */
+.nsyt-button { cursor: pointer; opacity: 0.9; transition: opacity 120ms ease-out, transform 120ms ease-out; }
+.nsyt-button:hover { opacity: 1; transform: scale(1.14); }
+.nsyt-button:active { transform: scale(0.96); }
 .nsyt-button svg { fill: #fff; width: 24px; height: 24px; }
 .nsyt-button.nsyt-active svg { fill: #3ea6ff; }
 
-.nsyt-canvas {
+/* ===== Result canvas (drawn over the hidden <video>) ===== */
+.nsyt-canvas { position: absolute; top: 0; left: 0; z-index: 30; pointer-events: none; display: block; background: #000; }
+
+/* ===== Position-adjustment overlay ===== */
+.nsyt-overlay {
+  position: absolute; inset: 0; z-index: 62;
+  cursor: grab; touch-action: none; user-select: none;
+  animation: nsyt-fade-in 120ms ease-out;
+  overflow: hidden;
+}
+.nsyt-overlay.nsyt-dragging { cursor: grabbing; }
+@keyframes nsyt-fade-in { from { opacity: 0; } to { opacity: 1; } }
+
+.nsyt-frame {
   position: absolute;
-  left: 0; top: 0;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.55);
+  outline: 2px solid rgba(255, 255, 255, 0.85);
+  outline-offset: -2px;
   pointer-events: none;
-  z-index: 2;
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.3) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.3) 1px, transparent 1px);
+  background-size: 33.334% 33.334%;
+  background-position: -1px -1px;
 }
 
-/* Trigger buttons sit inline in YouTube's own .ytp-right-controls row, next to the fill button. */
-.nsyt-panel-wrap { display: inline-flex; align-items: center; }
-
-.nsyt-panel-btn {
-  width: auto !important;
-  padding: 0 10px;
-  font-family: "YouTube Sans", Roboto, Arial, sans-serif;
-  font-size: 13px;
-  color: #fff;
-  white-space: nowrap;
+.nsyt-hint {
+  position: absolute; top: 22px; left: 50%; transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.7); color: #fff;
+  font: 500 17px/1.4 "YouTube Noto", Roboto, Arial, sans-serif;
+  padding: 10px 22px; border-radius: 20px;
+  pointer-events: none; white-space: nowrap; z-index: 2;
 }
-.nsyt-panel-btn.nsyt-on { color: #3ea6ff; }
-.nsyt-panel-btn.nsyt-open { background: rgba(255, 255, 255, 0.15); }
 
-/* The dropdown itself lives on <body> (see content.js: buildPanel), positioned by JS from the trigger button's screen rect - NOT nested under the
-   control row, which clips overflowing children on some YouTube layouts. Max z-index: above the fullscreen player's own stacking context. */
-.nsyt-panel {
-  position: fixed;
-  z-index: 2147483647;
-  min-width: 220px;
-  background: rgba(20, 20, 20, 0.95);
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  border-radius: 6px;
-  padding: 10px 12px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
-  font-family: "YouTube Sans", Roboto, Arial, sans-serif;
+/* Button row: DLSS5 menu, Кадры menu, apply, cancel - raised above YouTube's own recommendation arrow (bottom-centre) */
+.nsyt-controls {
+  position: absolute; bottom: 110px; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 12px; z-index: 2; max-width: 96vw;
+}
+
+.nsyt-controls > button {
+  width: 48px; height: 48px; border-radius: 50%; border: none;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+  transition: transform 120ms ease-out, filter 120ms ease-out;
+}
+.nsyt-controls > button:hover { transform: scale(1.14); filter: brightness(1.12); }
+.nsyt-controls > button:active { transform: scale(0.96); }
+.nsyt-controls > button svg { width: 23px; height: 23px; fill: #fff; }
+.nsyt-apply { background: #3ea6ff; }
+.nsyt-cancel { background: #444; }
+
+/* ===== DLSS5 / Кадры dropdown menus (same slot the sample's upscaler/frame-count menus used) ===== */
+.nsyt-menu-wrap { position: relative; display: flex; align-items: center; }
+
+.nsyt-menu-btn {
+  height: 48px; min-width: 96px; padding: 0 16px;
+  border: none; border-radius: 24px; background: #444; color: #fff;
+  cursor: pointer; font: 600 13.5px/1 "YouTube Noto", Roboto, Arial, sans-serif;
+  letter-spacing: 0.3px; white-space: nowrap; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+  transition: transform 120ms ease-out, filter 120ms ease-out;
+}
+.nsyt-menu-btn:hover { transform: scale(1.12); filter: brightness(1.15); }
+.nsyt-menu-btn:active { transform: scale(0.97); }
+.nsyt-menu-btn.nsyt-on { background: #2b9348; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5), inset 0 0 0 2px rgba(255, 255, 255, 0.25); }
+.nsyt-menu-btn.nsyt-open { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5), inset 0 0 0 2px rgba(255, 255, 255, 0.55); }
+
+.nsyt-menu {
+  position: absolute; bottom: calc(100% + 14px); left: 50%; transform: translateX(-50%);
+  width: 260px; padding: 10px 12px;
+  background: rgba(24, 24, 24, 0.97); border-radius: 14px;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.7);
+  display: flex; flex-direction: column; gap: 2px;
+  animation: nsyt-menu-in 130ms ease-out;
+}
+.nsyt-menu[hidden] { display: none; }
+@keyframes nsyt-menu-in { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; transform: translate(-50%, 0); } }
+.nsyt-menu::after {
+  content: ""; position: absolute; top: 100%; left: 50%; margin-left: -8px;
+  border: 8px solid transparent; border-top-color: rgba(24, 24, 24, 0.97);
 }
 
 .nsyt-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 0;
-  color: #eee;
-  font-size: 12px;
+  display: flex; align-items: center; gap: 8px; padding: 5px 0;
+  color: #eee; font: 400 12.5px/1.3 "YouTube Noto", Roboto, Arial, sans-serif;
 }
 .nsyt-row-label { flex: 1 1 auto; white-space: nowrap; }
 .nsyt-row-val { width: 34px; text-align: right; color: #aaa; font-variant-numeric: tabular-nums; }
