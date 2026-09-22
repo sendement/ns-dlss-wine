@@ -1,20 +1,39 @@
 // SPDX-License-Identifier: MIT
 // MV3 service worker: holds the WebSocket connection to the local ns-dlss-wine bridge (app/yt_bridge.py, ws://127.0.0.1:8765 by default) and relays
 // messages to/from the content script over a long-lived Port ("ns-yt"). The content script never opens the WebSocket itself (page CSP can vary; the
-// extension's own background context is the reliable place for this) - it only exchanges structured-clone messages (including transferable ArrayBuffers
-// for frame pixels) with this worker.
+// extension's own background context is the reliable place for this).
+//
+// chrome.runtime.Port.postMessage() only accepts a JSON-ifiable message (unlike window.postMessage, it does NOT structured-clone ArrayBuffer -
+// pixel data sent as a raw ArrayBuffer field silently arrives on the other end as an empty {} object, no error, confirmed by direct inspection).
+// Frame pixels therefore travel as a base64 string field (`bufferB64`) in both directions and are encoded/decoded right at the Port boundary; the
+// real WebSocket to the Python bridge still carries true binary frames (WebSocket.send/onmessage are unaffected, this limitation is Port-only).
 //
 // Port protocol (content -> background):
 //   {type: "configure", wsUrl, config: {src_w, src_h, dlss5: {...}, framegen: {...}}}   - (re)connects if wsUrl changed, then sends `config` as JSON
-//   {type: "frame", seq, w, h, buffer: ArrayBuffer}                                      - one RGBA8 source frame, framed as SRC1 and sent over the WS
+//   {type: "frame", seq, w, h, bufferB64: string}                                       - one RGBA8 source frame, framed as SRC1 and sent over the WS
 //   {type: "stop"}                                                                       - closes the WebSocket
 // Port protocol (background -> content):
 //   {type: "ws_open"} / {type: "ws_error", message} / {type: "ws_closed"}
 //   {type: "config_ack", ok, error}                                                      - relayed verbatim from the bridge's JSON reply
-//   {type: "output", seq, idx, count, w, h, flags, ptsMs, buffer: ArrayBuffer}            - one processed frame (flags bit0 = BGRA pixel order)
+//   {type: "output", seq, idx, count, w, h, flags, ptsMs, bufferB64: string}              - one processed frame (flags bit0 = BGRA pixel order)
 
 const SRC_HDR_BYTES = 20;   // magic(4) seq(u32) unused(u32) w(u32) h(u32)
 const OUT_HDR_BYTES = 32;   // magic(4) seq(u32) idx(u32) count(u32) w(u32) h(u32) flags(u32) pts_ms(f32)
+
+function bufToBase64(buf) {
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  let binary = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  return btoa(binary);
+}
+
+function base64ToBuf(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
 
 function buildSrcHeader(seq, w, h) {
   const buf = new ArrayBuffer(SRC_HDR_BYTES);
@@ -82,7 +101,7 @@ chrome.runtime.onConnect.addListener((port) => {
       }
       const hdr = parseOutHeader(ev.data);
       const pixels = ev.data.slice(OUT_HDR_BYTES);
-      safeSend({ type: 'output', ...hdr, buffer: pixels });
+      safeSend({ type: 'output', ...hdr, bufferB64: bufToBase64(pixels) });
     };
   };
 
@@ -100,16 +119,12 @@ chrome.runtime.onConnect.addListener((port) => {
         }
         case 'frame': {
           if (!ws) break;
-          if (msg.seq === 1) {
-            safeSend({ type: 'bg_error', message: 'frame debug: typeof=' + typeof msg.buffer + ' ctor=' +
-              (msg.buffer && msg.buffer.constructor && msg.buffer.constructor.name) + ' byteLength=' + (msg.buffer && msg.buffer.byteLength) +
-              ' keys=' + (msg.buffer && typeof msg.buffer === 'object' ? Object.keys(msg.buffer).join(',') : '') });
-          }
-          if (!msg.buffer || !msg.buffer.byteLength) { safeSend({ type: 'bg_error', message: 'frame message arrived with no usable buffer (seq=' + msg.seq + ')' }); break; }
+          if (!msg.bufferB64) { safeSend({ type: 'bg_error', message: 'frame message arrived with no usable buffer (seq=' + msg.seq + ')' }); break; }
+          const pixels = base64ToBuf(msg.bufferB64);
           const hdr = buildSrcHeader(msg.seq, msg.w, msg.h);
-          const out = new Uint8Array(SRC_HDR_BYTES + msg.buffer.byteLength);
+          const out = new Uint8Array(SRC_HDR_BYTES + pixels.byteLength);
           out.set(new Uint8Array(hdr), 0);
-          out.set(new Uint8Array(msg.buffer), SRC_HDR_BYTES);
+          out.set(new Uint8Array(pixels), SRC_HDR_BYTES);
           if (ws.readyState === WebSocket.OPEN) ws.send(out.buffer); else pendingFrame = out.buffer;
           break;
         }

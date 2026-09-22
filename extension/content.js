@@ -13,6 +13,22 @@
   const DEBUG = true;
   function log(...a) { if (DEBUG) console.log('[ns-yt]', ...a); }
 
+  // chrome.runtime.Port.postMessage() only accepts a JSON-ifiable message - unlike window.postMessage, it does NOT structured-clone ArrayBuffer (a raw
+  // ArrayBuffer field silently arrives on the other end as an empty {} object, confirmed by direct inspection). Frame pixels therefore travel as base64.
+  function bufToBase64(buf) {
+    const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    let binary = '';
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    return btoa(binary);
+  }
+  function base64ToBuf(b64) {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes.buffer;
+  }
+
   const DEFAULT_WS_URL = 'ws://127.0.0.1:8765';
   const DEFAULT_SETTINGS = {
     dlss5: { enabled: true, scale: 0.5, intensity: 1.0, local_tone: 1.0, local_structure: 1.0, skin_structure: -1.0, style: 1, auto_mask: 0, ui_correction: 0 },
@@ -289,10 +305,7 @@
       if (!this._sourceCache) this._sourceCache = new Map();
       this._sourceCache.set(this.seq, data.data.slice());
       if (this._sourceCache.size > 4) this._sourceCache.delete(Math.min(...this._sourceCache.keys()));
-      // chrome.runtime.Port.postMessage() has no transferable-objects overload (unlike window.postMessage) - a second "transfer list" argument here is
-      // silently ignored rather than rejected, which looks like it works but actually makes every ArrayBuffer field arrive on the other end as an
-      // empty {} (byteLength undefined). Just send the message; structured clone copies the buffer's bytes by value on its own.
-      this.port.postMessage({ type: 'frame', seq: this.seq, w: c.sw, h: c.sh, buffer: data.data.buffer });
+      this.port.postMessage({ type: 'frame', seq: this.seq, w: c.sw, h: c.sh, bufferB64: bufToBase64(data.data.buffer) });
     }
 
     _onMessage(msg) {
@@ -310,6 +323,7 @@
     }
 
     _onOutput(msg) {
+      msg.buffer = base64ToBuf(msg.bufferB64);
       this.received = (this.received || 0) + 1;
       if (this.received === 1) log('first processed frame received (' + msg.w + 'x' + msg.h + (msg.flags & 1 ? ', BGRA' : '') + ') - showing it now');
       const isReal = msg.idx === msg.count - 1;   // the last reply of a set is the real (non-generated) frame, matching the source frame `msg.seq`
