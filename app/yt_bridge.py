@@ -154,6 +154,12 @@ async def handle(ws):
             rgba = np.frombuffer(msg, dtype=np.uint8, count=w * h * 4, offset=SRC_HDR.size).reshape(h, w, 4)
             if seq == 1:
                 log(f"received first frame ({w}x{h}), dispatching to pipeline - can take up to 90s if the worker is still loading its model")
+                if os.environ.get("NS_YT_DUMP"):
+                    try:
+                        Image.fromarray(rgba, "RGBA").save("/home/sendem/логгг_source.png")
+                        log("dumped source frame to /home/sendem/логгг_source.png")
+                    except Exception as exc:  # noqa: BLE001
+                        log("source dump failed:", exc)
             t0 = time.perf_counter()
             try:
                 # Worker/upscaler/framegen calls are synchronous (time.sleep spin-waits, designed for live_filter.py's own threads) - run this off the event
@@ -165,6 +171,14 @@ async def handle(ws):
                 continue
             dt = (time.perf_counter() - t0) * 1000
             count = len(results)
+            if seq == 1 and os.environ.get("NS_YT_DUMP"):
+                try:
+                    real_frame, real_bgra, _ = results[-1]
+                    arr = real_frame[..., [2, 1, 0, 3]] if real_bgra else real_frame
+                    Image.fromarray(arr, "RGBA").save("/home/sendem/логгг_output.png")
+                    log(f"dumped first output frame to /home/sendem/логгг_output.png {arr.shape}")
+                except Exception as exc:  # noqa: BLE001
+                    log("output dump failed:", exc)
             for idx, (frame, is_bgra, pts_ms) in enumerate(results):
                 fh, fw = frame.shape[:2]
                 payload = frame.tobytes()
