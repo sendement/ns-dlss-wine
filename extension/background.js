@@ -44,18 +44,31 @@ chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'ns-yt') return;
   let ws = null;
   let wsUrl = null;
+  // The WebSocket handshake is asynchronous even to localhost; content.js's capture loop can call 'frame' before it resolves. A frame silently
+  // dropped here (as opposed to queued) leaves the content script's send/receive back-pressure counter permanently off by one - after two such
+  // drops content.js's `pending >= 2` gate blocks it from ever sending another frame, matching a "config_ack ok received, then nothing forever"
+  // symptom with no error anywhere. Queue the latest of each kind and flush in order once the socket actually opens; only the LATEST frame is kept
+  // (an older one queued behind it is stale anyway) - content.js's back-pressure counter only cares that SOME reply eventually arrives, not which.
+  let pendingConfig = null;
+  let pendingFrame = null;
 
   const safeSend = (msg, transfer) => {
     try { transfer ? port.postMessage(msg, transfer) : port.postMessage(msg); } catch (e) { /* port already closed */ }
+  };
+
+  const flushPending = () => {
+    if (pendingConfig !== null) { ws.send(pendingConfig); pendingConfig = null; }
+    if (pendingFrame !== null) { ws.send(pendingFrame); pendingFrame = null; }
   };
 
   const connect = (url) => {
     if (ws && wsUrl === url && ws.readyState <= WebSocket.OPEN) return;
     if (ws) { try { ws.close(); } catch (e) {} }
     wsUrl = url;
+    pendingConfig = pendingFrame = null;
     ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
-    ws.onopen = () => safeSend({ type: 'ws_open' });
+    ws.onopen = () => { safeSend({ type: 'ws_open' }); flushPending(); };
     ws.onerror = () => safeSend({ type: 'ws_error', message: 'could not reach the bridge at ' + url + ' (is app/yt_bridge.py running?)' });
     ws.onclose = () => safeSend({ type: 'ws_closed' });
     ws.onmessage = (ev) => {
@@ -71,21 +84,23 @@ chrome.runtime.onConnect.addListener((port) => {
 
   port.onMessage.addListener((msg) => {
     switch (msg.type) {
-      case 'configure':
+      case 'configure': {
         connect(msg.wsUrl || 'ws://127.0.0.1:8765');
-        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg.config));
-        else ws.addEventListener('open', () => ws.send(JSON.stringify(msg.config)), { once: true });
+        const cfgStr = JSON.stringify(msg.config);
+        if (ws.readyState === WebSocket.OPEN) ws.send(cfgStr); else pendingConfig = cfgStr;
         break;
-      case 'frame':
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          const hdr = buildSrcHeader(msg.seq, msg.w, msg.h);
-          const out = new Uint8Array(SRC_HDR_BYTES + msg.buffer.byteLength);
-          out.set(new Uint8Array(hdr), 0);
-          out.set(new Uint8Array(msg.buffer), SRC_HDR_BYTES);
-          ws.send(out.buffer);
-        }
+      }
+      case 'frame': {
+        if (!ws) break;
+        const hdr = buildSrcHeader(msg.seq, msg.w, msg.h);
+        const out = new Uint8Array(SRC_HDR_BYTES + msg.buffer.byteLength);
+        out.set(new Uint8Array(hdr), 0);
+        out.set(new Uint8Array(msg.buffer), SRC_HDR_BYTES);
+        if (ws.readyState === WebSocket.OPEN) ws.send(out.buffer); else pendingFrame = out.buffer;
         break;
+      }
       case 'stop':
+        pendingConfig = pendingFrame = null;
         if (ws) { try { ws.close(); } catch (e) {} ws = null; wsUrl = null; }
         break;
       // 'ping' (content.js's MV3 keepalive heartbeat) needs no handling - receiving ANY port message resets this service worker's ~30s idle timer,
@@ -94,6 +109,7 @@ chrome.runtime.onConnect.addListener((port) => {
   });
 
   port.onDisconnect.addListener(() => {
+    pendingConfig = pendingFrame = null;
     if (ws) { try { ws.close(); } catch (e) {} ws = null; }
   });
 });
