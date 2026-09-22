@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: MIT
 """Local WebSocket bridge for the ns-dlss-yt browser extension (extension/): the content script sends video frames (already cropped to aspect ratio in the
 page, cheap DOM/canvas work) and receives back the result of the SAME pipeline the live screen filter uses - DLSS5 (worker.py, rendering at a scaled-down
-size and reconstructing straight back up to the crop's native size - it does this internally, so no separate upscaler stage is needed) -> frame generation
-(app/framegen) - each stage optional and bypassed when off, matching the extension's two player buttons.
+size and returning it AT THAT size, no internal reconstruction) -> RTX VSR (upscales back to the crop's native size, only when DLSS5 rendered smaller) ->
+frame generation (app/framegen) - each stage optional/skippable, matching the extension's two player buttons (VSR itself has no button - it's purely the
+glue between DLSS5's render size and the crop's native size, automatic).
+DLSS5's own internal reconstruction (full_w/full_h) was tried first and dropped: confirmed via a raw frame dump that it corrupts its output (a sheared,
+mostly-black image) for any non-1:1 work/full ratio, not just extreme ones - so DLSS5 here always renders and returns at its own work size.
 
 One WebSocket connection = one browser tab's pipeline (its own Worker/framegen instances, created lazily and torn down on disconnect or on a size change).
 Wire protocol:
@@ -31,6 +34,7 @@ import paths as nspaths  # noqa: E402
 from live_state import DlssParams  # noqa: E402
 from worker import Worker, WorkerError  # noqa: E402
 from framegen import REGISTRY as FRAMEGEN_REGISTRY, FrameGenSettings, uniform_timestamps  # noqa: E402
+from upscalers import REGISTRY as UPSCALER_REGISTRY  # noqa: E402
 
 SRC_HDR = struct.Struct("<4sIIII")      # magic, seq, unused, w, h
 OUT_HDR = struct.Struct("<4sIIIIIIf")   # magic, seq, idx, count, w, h, flags (bit0 = BGRA order), pts_ms
@@ -43,15 +47,18 @@ def log(*a):
 
 
 class Pipeline:
-    """One tab's processing chain: DLSS5 (renders at a scaled-down size and reconstructs straight back up to the crop's native size - its own built-in
-    upscale, so no separate upscaler stage) -> frame generation. Either stage may be off; the frame just flows through to the next one unchanged. Torn down
-    and rebuilt whenever the source size or a stage's own size-affecting settings change (mirrors live_filter.py's `_ensure_fg`/`Worker.reconfigure`)."""
+    """One tab's processing chain: DLSS5 (renders at a scaled-down size, returns it at that same size - no internal reconstruction, see the module
+    docstring) -> RTX VSR (upscales that back to the crop's native size, only when DLSS5 actually rendered smaller) -> frame generation. Any stage may be
+    off/a no-op; the frame just flows through to the next one unchanged. Torn down and rebuilt whenever the source size or a stage's own size-affecting
+    settings change (mirrors live_filter.py's `_ensure_fg`/`Worker.reconfigure`)."""
 
     def __init__(self):
         self.src_w = self.src_h = 0
         self.cfg = {}
         self.worker = None
         self.worker_key = None
+        self.vsr = None
+        self.vsr_key = None
         self.fg = None
         self.fg_key = None
 
@@ -61,11 +68,9 @@ class Pipeline:
         log(f"configure: src={src_w}x{src_h} dlss5={cfg.get('dlss5')} framegen={cfg.get('framegen')}")
         d = cfg.get("dlss5") or {}
         if d.get("enabled"):
-            # Render at `scale` of the cropped size, reconstruct straight back up to src_w/src_h (full_w/full_h below) - DLSS5's own built-in upscale.
-            # wh is DERIVED from ww via the crop's own aspect ratio, not floored independently: DLSS5's reconstruction corrupts its output (a sheared,
-            # mostly-black image, confirmed by dumping the raw output frame) when the work size's aspect ratio doesn't exactly match the full size's -
-            # independent per-axis rounding drifts them apart for most crop sizes (e.g. 1222x1080 at scale=0.25 gave a 1222x1080 crop, work 304x270:
-            # aspect 1.126 vs the crop's 1.131 - close, but not exact, and that was enough to break the reconstruction).
+            # Render at `scale` of the cropped size and return it AT THAT size - DLSS5's own internal reconstruction was dropped (module docstring); a
+            # separate RTX VSR stage below does the actual upscale back to src_w/src_h. wh is derived from ww via the crop's own aspect ratio rather than
+            # floored independently, so the work rectangle stays proportional to the crop (VSR itself only cares that it's given a real image to upscale).
             scale = max(0.1, min(1.0, float(d.get("scale", 0.5))))
             ww = max(2, int(src_w * scale) & ~1)
             wh = max(2, int(round(ww * src_h / src_w)) & ~1)
@@ -73,17 +78,29 @@ class Pipeline:
                                 ui_correction=int(d.get("ui_correction", 0)), intensity=float(d.get("intensity", 1.0)),
                                 local_tone=float(d.get("local_tone", 1.0)), local_structure=float(d.get("local_structure", 1.0)),
                                 skin_structure=float(d.get("skin_structure", -1.0)))
-            key = (src_w, src_h, ww, wh)
+            key = (ww, wh)
             if self.worker is None or self.worker_key != key:
                 if self.worker is not None:
                     self.worker.close()
-                self.worker = Worker(ww, wh, src_w, src_h, params=params, max_w=src_w, max_h=src_h, max_out_w=src_w, max_out_h=src_h)
+                self.worker = Worker(ww, wh, params=params, max_w=ww, max_h=wh)
                 self.worker_key = key
             else:
-                self.worker.reconfigure(ww, wh, src_w, src_h, params=params)
-        elif self.worker is not None:
-            self.worker.close()
-            self.worker = self.worker_key = None
+                self.worker.reconfigure(ww, wh, params=params)
+            if (ww, wh) != (src_w, src_h):
+                if self.vsr is None:
+                    self.vsr = UPSCALER_REGISTRY["rtx_vsr"]()
+                self.vsr.configure(ww, wh, src_w, src_h, quality=4)
+                self.vsr_key = (ww, wh, src_w, src_h)
+            elif self.vsr is not None:
+                self.vsr.close()
+                self.vsr = self.vsr_key = None
+        else:
+            if self.worker is not None:
+                self.worker.close()
+                self.worker = self.worker_key = None
+            if self.vsr is not None:
+                self.vsr.close()
+                self.vsr = self.vsr_key = None
 
         f = cfg.get("framegen") or {}
         if f.get("enabled"):
@@ -101,7 +118,8 @@ class Pipeline:
             self.fg.close()
             self.fg = self.fg_key = None
 
-        log(f"configure done: worker={'on ' + str(self.worker_key) if self.worker else 'off'} framegen={'on ' + str(self.fg_key) if self.fg else 'off'}")
+        log(f"configure done: worker={'on ' + str(self.worker_key) if self.worker else 'off'} vsr={'on ' + str(self.vsr_key) if self.vsr else 'off'} "
+            f"framegen={'on ' + str(self.fg_key) if self.fg else 'off'}")
 
     def process(self, rgba: np.ndarray):
         """One source frame -> list of (rgba_or_bgra, is_bgra, pts_ms) to send, in display order. Frame generation (if on) yields the generated frames first
@@ -109,12 +127,13 @@ class Pipeline:
         frame = rgba
         if self.worker is not None:
             if (frame.shape[1], frame.shape[0]) != (self.worker.w, self.worker.h):
-                # the client sends the full-size cropped frame; DLSS5 wants it already at its own (scaled-down) work size - it does the upscale back up on
-                # the way out, not the way in
+                # the client sends the full-size cropped frame; DLSS5 wants it already at its own (scaled-down) work size
                 frame = np.asarray(Image.fromarray(frame, "RGBA").resize((self.worker.w, self.worker.h), Image.BILINEAR))
             out = self.worker.process(frame)
             if out is not None:
                 frame = out   # None = still priming (first frame(s)) - keep feeding the pre-DLSS5 frame downstream rather than stall the pipeline
+            if self.vsr is not None:
+                frame = self.vsr.upscale(frame)   # DLSS5 returns its own (smaller) work size now - VSR does the actual upscale back to src_w/src_h
         if self.fg is None:
             return [(frame, False, 0.0)]
         gens = self.fg.submit(frame, uniform_timestamps(self.fg.cfg.multiplier) if self.fg.supports_timestamps else None)
@@ -128,6 +147,8 @@ class Pipeline:
     def close(self):
         if self.worker is not None:
             self.worker.close()
+        if self.vsr is not None:
+            self.vsr.close()
         if self.fg is not None:
             self.fg.close()
 
