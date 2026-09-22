@@ -9,6 +9,11 @@ generation, AMD FSR 3.1 frame generation; Lossless Scaling frame generation thro
 > Expect rough edges. It is independent and not affiliated with or endorsed by NVIDIA, AMD or the authors of the projects it interoperates with.
 > **The repository contains no proprietary files** - you provide them yourself (`user_files/README.md`).
 
+## Also in this repository: a YouTube browser extension
+`extension/` + `app/yt_bridge.py` - the same DLSS5/frame-generation backends, reached from a Chromium/Vivaldi extension instead of the desktop overlay: it
+crops a YouTube video to the player's aspect ratio, then optionally DLSS5-reconstructs and/or frame-generates it, through a small local WebSocket bridge
+that drives `app/worker.py` and `app/framegen/` directly. See `extension/README.md`.
+
 ## What it does
 - **Capture**
   - *Hyprland plugin* (recommended, `hyprplug/`): the compositor hands the window's **own buffer** (including subsurfaces, e.g. video planes) to the filter through shared memory
