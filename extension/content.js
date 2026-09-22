@@ -87,7 +87,11 @@
     else { sw = vw; sh = vw / containerRatio; sx = 0; sy = (vh - sh) * (posY / 100); }
     // even dimensions: the DLSS5/frame-generation backends require them
     sw = Math.max(2, Math.floor(sw / 2) * 2); sh = Math.max(2, Math.floor(sh / 2) * 2);
-    return { Cw: geom.Cw, Ch: geom.Ch, sx: Math.round(sx), sy: Math.round(sy), sw, sh };
+    sx = Math.round(sx); sy = Math.round(sy);
+    // sx/sy and sw/sh were rounded independently - clamp so the rectangle never extends past the video's own bounds (drawImage throws otherwise, silently
+    // killing the whole capture loop - see _schedule()'s comment).
+    sx = Math.min(Math.max(0, sx), vw - sw); sy = Math.min(Math.max(0, sy), vh - sh);
+    return { Cw: geom.Cw, Ch: geom.Ch, sx, sy, sw, sh };
   }
 
   const VIDEO_PROPS = ['position', 'top', 'left', 'width', 'height', 'object-fit', 'object-position', 'transform', 'max-width', 'max-height'];
@@ -238,11 +242,11 @@
 
     _schedule() {
       if (!this.running) return;
-      if (this.video.requestVideoFrameCallback) {
-        this._vfcHandle = this.video.requestVideoFrameCallback(() => { this._tick(); this._schedule(); });
-      } else {
-        this._rafHandle = requestAnimationFrame(() => { this._tick(); this._schedule(); });
-      }
+      // _tick() must never be allowed to throw straight out of this callback: rVFC/rAF only fire the NEXT one if THIS callback re-requests it below, so an
+      // uncaught exception here would silently kill the whole capture loop after a single bad frame - permanently, with nothing obviously wrong on screen.
+      const step = () => { try { this._tick(); } catch (e) { if (!this._tickErrorLogged) { this._tickErrorLogged = true; console.error('[ns-yt] _tick failed:', e); } } this._schedule(); };
+      if (this.video.requestVideoFrameCallback) this._vfcHandle = this.video.requestVideoFrameCallback(step);
+      else this._rafHandle = requestAnimationFrame(step);
     }
 
     _tick() {
