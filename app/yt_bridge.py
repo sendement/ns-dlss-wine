@@ -345,9 +345,12 @@ class Pipeline:
 
     def close(self):
         self._stop.set()
-        self._encode_pool.shutdown(wait=False, cancel_futures=True)
+        # Join the stage threads BEFORE shutting down the encode pool: _fg_step can still be mid-flight when _stop is set (it already picked up its
+        # current item) and its own submit() call to the pool would raise "cannot schedule new futures after shutdown" if the pool were already gone -
+        # harmless (caught and logged by _fg_run's own try/except) but noisy, and easy to avoid by ordering shutdown the other way around.
         for th in self._threads:
             th.join(timeout=5)
+        self._encode_pool.shutdown(wait=True, cancel_futures=True)
         if self.worker is not None:
             self.worker.close()
         if self.vsr is not None:
