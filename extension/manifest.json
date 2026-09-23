@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "Пропускает видео YouTube через DLSS5 (нейросетевая реконструкция) и генерацию промежуточных кадров с локального моста ns-dlss-wine.",
   "permissions": ["storage"],
+  "host_permissions": ["ws://127.0.0.1/*", "ws://localhost/*"],
   "icons": {
     "16": "icons/icon16.png",
     "32": "icons/icon32.png",

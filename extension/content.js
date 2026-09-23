@@ -1,32 +1,47 @@
 // SPDX-License-Identifier: MIT
 // YouTube content script: crops the video to the player's aspect ratio (draggable position, like the sample this project's geometry/overlay code is based
-// on), then optionally runs it through DLSS5 and/or frame generation via the local bridge (app/yt_bridge.py, through background.js).
+// on), then optionally runs it through DLSS5, RTX VSR and/or frame generation via a direct WebSocket to the local bridge (app/yt_bridge.py). See
+// BridgeRenderer below for why this script owns that WebSocket itself now instead of relaying through background.js.
 //
-// Pipeline: crop (here, cheap) -> DLSS5 (own internal upscale, worker.py) -> frame generation (framegen/*). Either stage can be off; the frame flows
-// through unchanged. Settings are only sent to the bridge ONCE, when the position-adjustment overlay is confirmed - not live while dragging a slider: the
-// DLSS5 worker tears down and rebuilds its own process on a size change (seconds, not milliseconds - see docs/worker-protocol.md), so the settings panels
-// live inside that same overlay (closed = no renderer exists yet = nothing to reconfigure), exactly mirroring how the sample's own upscale-mode menus only
-// ever showed up during that same adjustment step.
+// Pipeline: crop (here, cheap) -> VSR downscale -> DLSS5 (its own menu/settings each) -> VSR upscale (to the real on-screen size) -> frame generation
+// (framegen/*). Any stage can be off; the frame flows through unchanged. Settings are only sent to the bridge ONCE, when the position-adjustment overlay
+// is confirmed - not live while dragging a slider: the DLSS5/VSR backends tear down and rebuild their own process on a size change (seconds, not
+// milliseconds - see docs/worker-protocol.md), so the settings panels live inside that same overlay (closed = no renderer exists yet = nothing to
+// reconfigure), exactly mirroring how the sample's own upscale-mode menus only ever showed up during that same adjustment step.
 (function () {
   'use strict';
 
   const DEBUG = true;
   function log(...a) { if (DEBUG) console.log('[ns-yt]', ...a); }
 
-  // chrome.runtime.Port.postMessage() only accepts a JSON-ifiable message - unlike window.postMessage, it does NOT structured-clone ArrayBuffer (a raw
-  // ArrayBuffer field silently arrives on the other end as an empty {} object, confirmed by direct inspection). Frame pixels therefore travel as base64.
-  function bufToBase64(buf) {
-    const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-    let binary = '';
-    const CHUNK = 0x8000;
-    for (let i = 0; i < bytes.length; i += CHUNK) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
-    return btoa(binary);
+  // This content script owns the WebSocket to app/yt_bridge.py DIRECTLY (ws:// to 127.0.0.1 - Chrome treats localhost as a trustworthy origin, so this
+  // isn't blocked as mixed content from an https:// page, and a content script's own network requests aren't subject to the page's CSP). An earlier
+  // version routed frames through background.js over a chrome.runtime.Port instead, base64-encoding every frame (Port.postMessage only accepts
+  // JSON-ifiable data, confirmed by direct inspection - a raw ArrayBuffer field silently arrives as an empty {}). That base64 round-trip (a per-BYTE JS
+  // loop, run on every source AND every output frame) turned out to be the actual bottleneck once frames got large: at a real on-screen size like
+  // 2752x1152, one output frame is ~12.7MB, and encoding/decoding that in JS dwarfed every neural-net stage's own processing time (measured: server-side
+  // stages pipeline down to ~100ms/frame combined, but end-to-end throughput was ~1fps - the gap was this, not the GPU work). A raw WebSocket transfers
+  // ArrayBuffer natively, no encoding needed at all.
+  const SRC_HDR_BYTES = 20;   // magic(4) seq(u32) unused(u32) w(u32) h(u32)
+  const OUT_HDR_BYTES = 32;   // magic(4) seq(u32) idx(u32) count(u32) w(u32) h(u32) flags(u32) pts_ms(f32)
+
+  function buildSrcHeader(seq, w, h) {
+    const buf = new ArrayBuffer(SRC_HDR_BYTES);
+    const dv = new DataView(buf);
+    dv.setUint8(0, 0x53); dv.setUint8(1, 0x52); dv.setUint8(2, 0x43); dv.setUint8(3, 0x31);   // "SRC1"
+    dv.setUint32(4, seq >>> 0, true);
+    dv.setUint32(8, 0, true);
+    dv.setUint32(12, w, true);
+    dv.setUint32(16, h, true);
+    return buf;
   }
-  function base64ToBuf(b64) {
-    const binary = atob(b64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes.buffer;
+
+  function parseOutHeader(buf) {
+    const dv = new DataView(buf, 0, OUT_HDR_BYTES);
+    return {
+      seq: dv.getUint32(4, true), idx: dv.getUint32(8, true), count: dv.getUint32(12, true),
+      w: dv.getUint32(16, true), h: dv.getUint32(20, true), flags: dv.getUint32(24, true), ptsMs: dv.getFloat32(28, true),
+    };
   }
 
   const DEFAULT_WS_URL = 'ws://127.0.0.1:8765';
@@ -199,21 +214,16 @@
     if (s.reassertTimer) { clearInterval(s.reassertTimer); s.reassertTimer = null; }
   }
 
-  /* ============ BridgeRenderer: captures video frames, talks to background.js, draws the result back ============ */
+  /* ============ BridgeRenderer: owns the WebSocket to app/yt_bridge.py, captures video frames, draws the result back ============ */
 
-  // `chrome.runtime.connect()` throws "Extension context invalidated" when this content script was injected by a NOW-RELOADED copy of the extension
-  // (its background context no longer exists) - happens every time the extension is reloaded from chrome://extensions without also refreshing the
-  // tab. Not a bug to fix in code (there is no API to "reconnect" a stale content script to a new extension instance) - just give a clear message
-  // instead of letting the raw exception surface with no explanation.
+  // A raw WebSocket constructor throws synchronously on a CSP violation (rare in practice here - see the note above SRC_HDR_BYTES - but the one real,
+  // recurring failure mode is starting the renderer against a bridge that isn't running yet, which surfaces as ws.onerror, not a throw here). Kept as a
+  // safety net so any unexpected constructor-time error gets a clear console message instead of an uncaught exception.
   function createRenderer(player, video) {
     try {
       return new BridgeRenderer(player, video);
     } catch (e) {
-      if (e && /Extension context invalidated/.test(e.message || '')) {
-        console.error('[ns-yt] расширение было перезагружено — обновите страницу (F5) и попробуйте снова');
-      } else {
-        console.error('[ns-yt] failed to start:', e);
-      }
+      console.error('[ns-yt] failed to start:', e);
       return null;
     }
   }
@@ -230,6 +240,9 @@
       this.lastArrival = 0;
       this._dispDebounce = null;   // debounces reconfigure-on-resize (see layout()) - a window resize drag can fire many ResizeObserver events/second,
                                     // and each reconfigure restarts the VSR subprocess (seconds) - only the LAST size after the drag settles should apply
+      this.ws = null;
+      this._wsUrl = null;
+      this._pendingConfig = null;   // JSON string queued if a config is sent before the socket finishes connecting; flushed on open
 
       this.capture = document.createElement('canvas');
       this.captureCtx = this.capture.getContext('2d', { willReadFrequently: true });
@@ -239,13 +252,31 @@
       this.display = display;
       this.displayCtx = display.getContext('2d');
 
-      this.port = chrome.runtime.connect({ name: 'ns-yt' });
-      this.port.onMessage.addListener((msg) => this._onMessage(msg));
-      this.port.onDisconnect.addListener(() => { log('port disconnected'); clearInterval(this._pingTimer); });
-      // MV3 service workers are terminated after ~30s with no events; a port message resets that timer, but _tick() below stops sending frame messages
-      // entirely while `pending` is maxed out (e.g. the whole multi-second wait for DLSS5's first reply on a cold worker start) - without this, the
-      // background page (and this port, and the WebSocket it holds) can get killed mid-wait, right around when the first real reply would have arrived.
-      this._pingTimer = setInterval(() => { try { this.port.postMessage({ type: 'ping' }); } catch (e) { /* port already gone */ } }, 15000);
+      this._connect(settings.wsUrl || DEFAULT_WS_URL);
+    }
+
+    _connect(url) {
+      if (this.ws && this._wsUrl === url && this.ws.readyState <= WebSocket.OPEN) return;
+      if (this.ws) { try { this.ws.close(); } catch (e) { /* already gone */ } }
+      this._wsUrl = url;
+      this._pendingConfig = null;
+      const ws = new WebSocket(url);
+      this.ws = ws;
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = () => {
+        log('bridge connected');
+        if (this._pendingConfig !== null) { ws.send(this._pendingConfig); this._pendingConfig = null; }
+      };
+      ws.onerror = () => console.warn('[ns-yt] could not reach the bridge at ' + url + ' (is app/yt_bridge.py running?)');
+      ws.onclose = () => { log('bridge disconnected'); this.pending = 0; };
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === 'string') {
+          try { this._onMessage(JSON.parse(ev.data)); } catch (e) { /* ignore malformed */ }
+          return;
+        }
+        const hdr = parseOutHeader(ev.data);
+        this._onOutput({ ...hdr, buffer: ev.data.slice(OUT_HDR_BYTES) });
+      };
     }
 
     layout(crop) {
@@ -270,12 +301,10 @@
     _sendConfigure() {
       if (!this.crop) return;
       log('configuring pipeline:', this.crop.sw + 'x' + this.crop.sh, '->', this.crop.Cw + 'x' + this.crop.Ch, settings.dlss5, settings.vsr, settings.framegen);
-      this.port.postMessage({
-        type: 'configure',
-        wsUrl: settings.wsUrl || DEFAULT_WS_URL,
-        config: { type: 'config', src_w: this.crop.sw, src_h: this.crop.sh, disp_w: this.crop.Cw, disp_h: this.crop.Ch,
-                  dlss5: settings.dlss5, vsr: settings.vsr, framegen: settings.framegen },
-      });
+      this._connect(settings.wsUrl || DEFAULT_WS_URL);
+      const cfgStr = JSON.stringify({ type: 'config', src_w: this.crop.sw, src_h: this.crop.sh, disp_w: this.crop.Cw, disp_h: this.crop.Ch,
+                                       dlss5: settings.dlss5, vsr: settings.vsr, framegen: settings.framegen });
+      if (this.ws.readyState === WebSocket.OPEN) this.ws.send(cfgStr); else this._pendingConfig = cfgStr;
     }
 
     start() {
@@ -296,6 +325,7 @@
     _tick() {
       const v = this.video;
       if (!this.crop || !v || v.readyState < 2 || v.paused || v.seeking) return;
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;   // not connected yet - skip this tick, retry next frame
       if (this.pending >= 2) return;   // the bridge answers strictly in order - drop this tick's frame rather than pile up
       const now = performance.now();
       if (this.lastArrival) {
@@ -316,25 +346,20 @@
       if (!this._sourceCache) this._sourceCache = new Map();
       this._sourceCache.set(this.seq, data.data.slice());
       if (this._sourceCache.size > 4) this._sourceCache.delete(Math.min(...this._sourceCache.keys()));
-      this.port.postMessage({ type: 'frame', seq: this.seq, w: c.sw, h: c.sh, bufferB64: bufToBase64(data.data.buffer) });
+      const header = buildSrcHeader(this.seq, c.sw, c.sh);
+      const out = new Uint8Array(SRC_HDR_BYTES + data.data.byteLength);
+      out.set(new Uint8Array(header), 0);
+      out.set(data.data, SRC_HDR_BYTES);
+      this.ws.send(out.buffer);
     }
 
     _onMessage(msg) {
-      switch (msg.type) {
-        case 'ws_open': log('bridge connected'); break;
-        case 'ws_error': console.warn('[ns-yt]', msg.message); this.pending = 0; break;
-        case 'ws_closed': log('bridge disconnected'); this.pending = 0; break;
-        case 'bg_error': console.error('[ns-yt:bg]', msg.message); break;
-        case 'config_ack':
-          log('config_ack', msg.ok ? 'ok' : 'REJECTED: ' + msg.error);
-          if (!msg.ok) console.warn('[ns-yt] pipeline configuration rejected:', msg.error);
-          break;
-        case 'output': this._onOutput(msg); break;
-      }
+      if (msg.type !== 'config_ack') return;
+      log('config_ack', msg.ok ? 'ok' : 'REJECTED: ' + msg.error);
+      if (!msg.ok) console.warn('[ns-yt] pipeline configuration rejected:', msg.error);
     }
 
     _onOutput(msg) {
-      msg.buffer = base64ToBuf(msg.bufferB64);
       this.received = (this.received || 0) + 1;
       if (this.received === 1) log('first processed frame received (' + msg.w + 'x' + msg.h + (msg.flags & 1 ? ', BGRA' : '') + ') - showing it now');
       const isReal = msg.idx === msg.count - 1;   // the last reply of a set is the real (non-generated) frame, matching the source frame `msg.seq`
@@ -381,11 +406,10 @@
 
     destroy() {
       this.running = false;
-      clearInterval(this._pingTimer);
       clearTimeout(this._dispDebounce);
       if (this._vfcHandle && this.video.cancelVideoFrameCallback) this.video.cancelVideoFrameCallback(this._vfcHandle);
       if (this._rafHandle) cancelAnimationFrame(this._rafHandle);
-      try { this.port.postMessage({ type: 'stop' }); this.port.disconnect(); } catch (e) { /* already gone */ }
+      if (this.ws) { try { this.ws.close(); } catch (e) { /* already gone */ } }
       if (this.display.parentElement) this.display.remove();
     }
   }
