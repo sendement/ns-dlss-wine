@@ -26,6 +26,7 @@ Run: python3 app/yt_bridge.py [--port 8765]
 """
 import argparse
 import asyncio
+import concurrent.futures
 import io
 import json
 import os
@@ -126,9 +127,14 @@ class Pipeline:
         self._vsr_box = Mailbox()    # (seq, frame, t_submit) - post-resize/DLSS5
         self._fg_box = Mailbox()     # (seq, frame, t_submit) - post-VSR
         self._dumped = False         # NS_YT_DUMP: only the very first frame
-        self._stats = {"dlss5": [0, 0.0], "vsr": [0, 0.0], "framegen": [0, 0.0]}   # stage -> [count, sum_ms], logged every 60
+        self._stats = {"dlss5": [0, 0.0], "vsr": [0, 0.0], "framegen": [0, 0.0], "jpeg": [0, 0.0]}   # stage -> [count, sum_ms], logged every 60
+        self._stats_lock = threading.Lock()   # "jpeg" can be updated from either of the 2 encode-pool workers concurrently, unlike the other stages
         self._fps_n = 0
         self._fps_t0 = time.perf_counter()   # real (non-generated) frames actually delivered - the throughput number pipelining is meant to improve
+        # JPEG encoding (measured ~25-45ms/frame) runs in this separate pool, not on the fg thread: at framegen multiplier=2 that's 2 encodes per real
+        # submission, ~50-90ms - if done inline on _fg_run, that directly delays it from picking up the NEXT frame, capping throughput below what
+        # dlss5/vsr/framegen's own combined cost would otherwise allow. A 2-worker pool lets one submission's pair encode while the next is processed.
+        self._encode_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="ns-yt-encode")
         self._threads = [threading.Thread(target=self._dlss_run, daemon=True), threading.Thread(target=self._vsr_run, daemon=True),
                           threading.Thread(target=self._fg_run, daemon=True)]
         for th in self._threads:
@@ -208,13 +214,17 @@ class Pipeline:
             f"framegen={'on ' + str(self.fg_key) if self.fg else 'off'}")
 
     def _record(self, stage, ms):
-        s = self._stats[stage]
-        s[0] += 1
-        s[1] += ms
-        if s[0] >= 60:
-            log(f"[{stage}] avg {s[1] / s[0]:.1f}ms over the last {s[0]} frames")
-            s[0] = 0
-            s[1] = 0.0
+        with self._stats_lock:
+            s = self._stats[stage]
+            s[0] += 1
+            s[1] += ms
+            done = s[0] >= 60
+            if done:
+                avg = s[1] / s[0]
+                s[0] = 0
+                s[1] = 0.0
+        if done:
+            log(f"[{stage}] avg {avg:.1f}ms over the last 60 frames")
 
     def _dlss_run(self):
         while True:
@@ -324,12 +334,18 @@ class Pipeline:
             self._fps_n = 0
             self._fps_t0 = time.perf_counter()
         for idx, (out_frame, is_bgra, pts_ms) in enumerate(outs):
-            fh, fw = out_frame.shape[:2]
-            jpeg_bytes = _encode_jpeg(out_frame, is_bgra)
-            self._loop.call_soon_threadsafe(self._on_output, seq, idx, count, jpeg_bytes, fw, fh, pts_ms)
+            self._encode_pool.submit(self._encode_and_emit, seq, idx, count, out_frame, is_bgra, pts_ms)
+
+    def _encode_and_emit(self, seq, idx, count, out_frame, is_bgra, pts_ms):
+        fh, fw = out_frame.shape[:2]
+        t0 = time.perf_counter()
+        jpeg_bytes = _encode_jpeg(out_frame, is_bgra)
+        self._record("jpeg", (time.perf_counter() - t0) * 1000)
+        self._loop.call_soon_threadsafe(self._on_output, seq, idx, count, jpeg_bytes, fw, fh, pts_ms)
 
     def close(self):
         self._stop.set()
+        self._encode_pool.shutdown(wait=False, cancel_futures=True)
         for th in self._threads:
             th.join(timeout=5)
         if self.worker is not None:
