@@ -38,13 +38,13 @@ extern "C" __global__ void to_rgba(const float* __restrict__ src, unsigned char*
 
 
 def aligned(iw, ow):
-    """The DLPack output path needs 32-byte aligned float rows: pad the input width so that both padded widths are multiples of 8."""
-    for pad in range(0, 64):
-        piw = iw + pad
-        pow_ = round(piw * ow / iw)
-        if piw % 8 == 0 and pow_ % 8 == 0:
-            return piw, pow_
-    return iw, ow
+    """The DLPack output path needs 32-byte aligned float rows: pad each width up to the next multiple of 8. The two paddings need not share iw/ow's
+    exact ratio - _TO_CHW edge-replicates the extra input columns and _TO_RGBA crops the network's output back down to the real `ow` columns, so this
+    only has to satisfy the alignment requirement, not preserve the scale factor.
+    A previous version searched for a piw/pow_ pair that also preserved iw/ow's ratio exactly, padding only the input side; for most real-world sizes
+    (e.g. iw=304, ow=1222: 1222 % 8 == 6) no such pair exists within any reasonable search window, silently falling back to the UNALIGNED raw iw/ow -
+    which is exactly the case this function exists to avoid, and produced a corrupted (sheared, noisy) output, confirmed by dumping the raw frame."""
+    return (iw + 7) // 8 * 8, (ow + 7) // 8 * 8
 
 
 def main():
