@@ -323,10 +323,12 @@
     }
 
     _tick() {
+      this._ticks = (this._ticks || 0) + 1;
+      this._logTickStats();
       const v = this.video;
-      if (!this.crop || !v || v.readyState < 2 || v.paused || v.seeking) return;
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;   // not connected yet - skip this tick, retry next frame
-      if (this.pending >= 2) return;   // the bridge answers strictly in order - drop this tick's frame rather than pile up
+      if (!this.crop || !v || v.readyState < 2 || v.paused || v.seeking) { this._skipNotReady = (this._skipNotReady || 0) + 1; return; }
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) { this._skipNoWs = (this._skipNoWs || 0) + 1; return; }   // not connected yet - retry next frame
+      if (this.pending >= 2) { this._skipPending = (this._skipPending || 0) + 1; return; }   // answered strictly in order - drop rather than pile up
       const now = performance.now();
       if (this.lastArrival) {
         const dt = now - this.lastArrival;
@@ -351,6 +353,20 @@
       out.set(new Uint8Array(header), 0);
       out.set(data.data, SRC_HDR_BYTES);
       this.ws.send(out.buffer);
+    }
+
+    // Diagnostic: end-to-end fps is low even with fast per-frame server latency - need to see WHY _tick() isn't sending, not just that it isn't. Logs
+    // ticks/sends/skip-reasons every ~3s and resets, so a live session shows the actual capture-side cadence instead of guessing at it.
+    _logTickStats() {
+      const now = performance.now();
+      if (!this._statsT0) { this._statsT0 = now; return; }
+      if (now - this._statsT0 < 3000) return;
+      const dtS = (now - this._statsT0) / 1000;
+      log(`tick stats: ${this._ticks || 0} ticks in ${dtS.toFixed(1)}s (${((this._ticks || 0) / dtS).toFixed(1)}/s) - `
+        + `sent ${this.seq - (this._seqAtLastStats || 0)}, skip[notReady=${this._skipNotReady || 0} noWs=${this._skipNoWs || 0} pending=${this._skipPending || 0}]`);
+      this._seqAtLastStats = this.seq;
+      this._ticks = this._skipNotReady = this._skipNoWs = this._skipPending = 0;
+      this._statsT0 = now;
     }
 
     _onMessage(msg) {
