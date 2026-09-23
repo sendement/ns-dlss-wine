@@ -389,7 +389,10 @@ async def main():
     ap.add_argument("--host", default="127.0.0.1")
     args = ap.parse_args()
     log(f"listening on ws://{args.host}:{args.port}")
-    async with websockets.serve(handle, args.host, args.port, max_size=64 * 1024 * 1024):
+    # compression=None: the `websockets` library defaults to permessage-deflate, which was silently eating ~1s+ per frame CPU-compressing multi-megabyte
+    # photographic pixel data that barely compresses at all (confirmed: client-measured round-trip was ~1000-1500ms while the bridge's own per-frame
+    # processing latency was ~35-110ms - the gap was compression, not the network or the pipeline). This is localhost; there's nothing to save bandwidth on.
+    async with websockets.serve(handle, args.host, args.port, max_size=64 * 1024 * 1024, compression=None):
         await asyncio.Future()
 
 
