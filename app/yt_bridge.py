@@ -229,9 +229,14 @@ class Pipeline:
         # submission, ~50-90ms - if done inline on _fg_run, that directly delays it from picking up the NEXT frame, capping throughput below what
         # dlss5/vsr/framegen's own combined cost would otherwise allow. A 2-worker pool lets one submission's pair encode while the next is processed.
         self._encode_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="ns-yt-encode")
-        self._gpu_jpeg = None            # built lazily, off the event loop (CUDA init takes real time) - see _ensure_gpu_jpeg()
+        # Two independent GPU encoders, not one: GpuJpegEncoder serializes its own calls (the mmap req/ack protocol allows one in-flight request), and
+        # framegen (multiplier>=2) hands the encode pool 2 frames per real submission at once - one shared encoder just queued them behind each other,
+        # measured no faster overall than the single-worker CPU path it replaced. Two lets the real+generated pair genuinely encode in parallel, like the
+        # CPU pool's 2 threads did on 2 real cores. Built lazily (off the event loop - CUDA init takes real time), see _ensure_gpu_jpeg().
+        self._gpu_jpeg_pool = []
         self._gpu_jpeg_failed = False    # sticky: don't retry a slow failed GPU init on every frame once it's known not to work
         self._gpu_jpeg_lock = threading.Lock()
+        self._gpu_jpeg_next = 0
         self._threads = [threading.Thread(target=self._dlss_run, daemon=True), threading.Thread(target=self._vsr_run, daemon=True),
                           threading.Thread(target=self._fg_run, daemon=True)]
         for th in self._threads:
@@ -443,7 +448,7 @@ class Pipeline:
     def _encode_frame(self, out_frame: np.ndarray, is_bgra: bool) -> bytes:
         rgb = _to_rgb(out_frame, is_bgra)
         if not self._gpu_jpeg_failed:
-            enc = self._ensure_gpu_jpeg()
+            enc = self._pick_gpu_jpeg()
             if enc is not None:
                 try:
                     return enc.encode(rgb, JPEG_QUALITY)
@@ -452,22 +457,35 @@ class Pipeline:
                     self._gpu_jpeg_failed = True
         return _encode_jpeg_cpu(rgb)
 
-    def _ensure_gpu_jpeg(self):
-        if self._gpu_jpeg is not None or self._gpu_jpeg_failed:
-            return self._gpu_jpeg
+    def _pick_gpu_jpeg(self):
+        if not self._gpu_jpeg_pool and not self._gpu_jpeg_failed:
+            self._ensure_gpu_jpeg_pool()
+        if not self._gpu_jpeg_pool:
+            return None
         with self._gpu_jpeg_lock:
-            if self._gpu_jpeg is not None or self._gpu_jpeg_failed:
-                return self._gpu_jpeg
+            enc = self._gpu_jpeg_pool[self._gpu_jpeg_next % len(self._gpu_jpeg_pool)]
+            self._gpu_jpeg_next += 1
+        return enc
+
+    def _ensure_gpu_jpeg_pool(self, size=2):
+        with self._gpu_jpeg_lock:
+            if self._gpu_jpeg_pool or self._gpu_jpeg_failed:
+                return
             if not os.path.exists(nspaths.VENV_JPEG_PYTHON):
                 self._gpu_jpeg_failed = True   # not installed - runtime/venv-jpeg, see hosts/jpeg_encode_host.py's docstring - silently use CPU
-                return None
+                return
             try:
-                self._gpu_jpeg = GpuJpegEncoder()
-                log("GPU JPEG encoder ready")
+                self._gpu_jpeg_pool = [GpuJpegEncoder() for _ in range(size)]
+                log(f"GPU JPEG encoder ready ({size}x)")
             except Exception:  # noqa: BLE001
                 log("GPU JPEG encoder unavailable, using CPU:\n" + traceback.format_exc())
+                for enc in self._gpu_jpeg_pool:
+                    try:
+                        enc.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                self._gpu_jpeg_pool = []
                 self._gpu_jpeg_failed = True
-            return self._gpu_jpeg
 
     def close(self):
         self._stop.set()
@@ -483,8 +501,8 @@ class Pipeline:
             self.vsr.close()
         if self.fg is not None:
             self.fg.close()
-        if self._gpu_jpeg is not None:
-            self._gpu_jpeg.close()
+        for enc in self._gpu_jpeg_pool:
+            enc.close()
 
 
 async def handle(ws):
