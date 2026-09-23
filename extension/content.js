@@ -353,6 +353,11 @@
       out.set(new Uint8Array(header), 0);
       out.set(data.data, SRC_HDR_BYTES);
       this.ws.send(out.buffer);
+      // Kept for the round-trip diagnostic in _onOutput/_logRttStats - client-measured RTT vs. the bridge's own much-lower reported per-frame latency
+      // pins down whether a slowdown is server-side (pipeline) or client-side (message handling / putImageData blocking the main thread).
+      if (!this._sentAt) this._sentAt = new Map();
+      this._sentAt.set(this.seq, performance.now());
+      if (this._sentAt.size > 8) this._sentAt.delete(Math.min(...this._sentAt.keys()));
     }
 
     // Diagnostic: end-to-end fps is low even with fast per-frame server latency - need to see WHY _tick() isn't sending, not just that it isn't. Logs
@@ -376,17 +381,36 @@
     }
 
     _onOutput(msg) {
+      const recvAt = performance.now();
       this.received = (this.received || 0) + 1;
       if (this.received === 1) log('first processed frame received (' + msg.w + 'x' + msg.h + (msg.flags & 1 ? ', BGRA' : '') + ') - showing it now');
       const isReal = msg.idx === msg.count - 1;   // the last reply of a set is the real (non-generated) frame, matching the source frame `msg.seq`
       if (isReal) {
         this.pending = Math.max(0, this.pending - 1);
         this._logDiff(msg);
+        if (this._sentAt && this._sentAt.has(msg.seq)) {
+          this._rtt = (this._rtt || []); this._rtt.push(recvAt - this._sentAt.get(msg.seq)); this._sentAt.delete(msg.seq);
+        }
       }
       const bgra = !!(msg.flags & 1);
       const delayMs = Math.max(0, (this.frameInterval / Math.max(1, msg.count)) * msg.idx);
-      const draw = () => this._drawFrame(msg.w, msg.h, msg.buffer, bgra);
+      const draw = () => { const t0 = performance.now(); this._drawFrame(msg.w, msg.h, msg.buffer, bgra); this._drawMs = (this._drawMs || []); this._drawMs.push(performance.now() - t0); };
       if (delayMs < 2) draw(); else setTimeout(draw, delayMs);
+      this._logRttStats();
+    }
+
+    // Client-measured round trip (send -> real reply) and draw (putImageData) cost, every ~3s - pins down whether a slowdown is server-side (the bridge's
+    // own reported per-frame latency) or client-side (message handling / the main thread being busy with a big putImageData when the reply arrives).
+    _logRttStats() {
+      const now = performance.now();
+      if (!this._rttT0) { this._rttT0 = now; return; }
+      if (now - this._rttT0 < 3000) return;
+      const rtt = this._rtt || [], draws = this._drawMs || [];
+      const avg = (a) => (a.length ? (a.reduce((s, v) => s + v, 0) / a.length).toFixed(1) : 'n/a');
+      const max = (a) => (a.length ? Math.max(...a).toFixed(1) : 'n/a');
+      log(`rtt stats: avg=${avg(rtt)}ms max=${max(rtt)}ms over ${rtt.length} real replies, draw: avg=${avg(draws)}ms max=${max(draws)}ms over ${draws.length} draws`);
+      this._rtt = []; this._drawMs = [];
+      this._rttT0 = now;
     }
 
     // Objective yes/no answer to "is the pipeline actually changing the picture": mean absolute difference between the source frame this reply's `seq`
