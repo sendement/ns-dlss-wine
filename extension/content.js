@@ -31,7 +31,8 @@
 
   const DEFAULT_WS_URL = 'ws://127.0.0.1:8765';
   const DEFAULT_SETTINGS = {
-    dlss5: { enabled: true, scale: 0.5, intensity: 1.0, local_tone: 1.0, local_structure: 1.0, skin_structure: -1.0, style: 1, auto_mask: 0, ui_correction: 0 },
+    dlss5: { enabled: true, intensity: 1.0, local_tone: 1.0, local_structure: 1.0, skin_structure: -1.0, style: 1, auto_mask: 0, ui_correction: 0 },
+    vsr: { enabled: true, scale: 0.5, quality: 4 },
     framegen: { enabled: false, method: 'dlssg', multiplier: 2 },
     wsUrl: DEFAULT_WS_URL,
   };
@@ -48,6 +49,7 @@
   function applySettings(raw) {
     Object.assign(settings, DEFAULT_SETTINGS, raw || {});
     settings.dlss5 = Object.assign({}, DEFAULT_SETTINGS.dlss5, (raw && raw.dlss5) || {});
+    settings.vsr = Object.assign({}, DEFAULT_SETTINGS.vsr, (raw && raw.vsr) || {});
     settings.framegen = Object.assign({}, DEFAULT_SETTINGS.framegen, (raw && raw.framegen) || {});
   }
   function persist() {
@@ -226,6 +228,8 @@
       this.pending = 0;           // frames sent but not yet fully answered - back-pressure (the bridge answers one source frame at a time)
       this.frameInterval = 1000 / 30;
       this.lastArrival = 0;
+      this._dispDebounce = null;   // debounces reconfigure-on-resize (see layout()) - a window resize drag can fire many ResizeObserver events/second,
+                                    // and each reconfigure restarts the VSR subprocess (seconds) - only the LAST size after the drag settles should apply
 
       this.capture = document.createElement('canvas');
       this.captureCtx = this.capture.getContext('2d', { willReadFrequently: true });
@@ -245,25 +249,32 @@
     }
 
     layout(crop) {
-      const changed = !this.crop || this.crop.sw !== crop.sw || this.crop.sh !== crop.sh;
+      const sourceChanged = !this.crop || this.crop.sw !== crop.sw || this.crop.sh !== crop.sh;
+      // A pure display-size change (window/player resize, fullscreen, theater mode - crop.sw/sh, the native video pixels, stay the same) still needs a
+      // reconfigure: VSR's upscale target is the on-screen size (crop.Cw x Ch), not the native crop - see _sendConfigure. This never touches DLSS5's own
+      // work size (src_w/src_h + the vsr.scale ratio, unaffected by Cw/Ch), so the bridge only rebuilds the cheaper VSR stage, not the DLSS5 Wine process.
+      const displayChanged = !this.crop || this.crop.Cw !== crop.Cw || this.crop.Ch !== crop.Ch;
       this.crop = crop;
       this.display.style.width = crop.Cw + 'px';
       this.display.style.height = crop.Ch + 'px';
       if (this.display.parentElement !== this.player) this.player.appendChild(this.display);
-      if (changed) {
+      if (sourceChanged) {
         this.capture.width = crop.sw; this.capture.height = crop.sh;
-        this.display.width = crop.sw; this.display.height = crop.sh;   // canvas backing store; CSS above stretches it to the player box
-        this._sendConfigure();
+        this.display.width = crop.sw; this.display.height = crop.sh;   // canvas backing store; CSS above stretches it until the first real frame arrives
       }
+      clearTimeout(this._dispDebounce);
+      if (sourceChanged) this._sendConfigure();
+      else if (displayChanged) this._dispDebounce = setTimeout(() => this._sendConfigure(), 400);
     }
 
     _sendConfigure() {
       if (!this.crop) return;
-      log('configuring pipeline:', this.crop.sw + 'x' + this.crop.sh, settings.dlss5, settings.framegen);
+      log('configuring pipeline:', this.crop.sw + 'x' + this.crop.sh, '->', this.crop.Cw + 'x' + this.crop.Ch, settings.dlss5, settings.vsr, settings.framegen);
       this.port.postMessage({
         type: 'configure',
         wsUrl: settings.wsUrl || DEFAULT_WS_URL,
-        config: { type: 'config', src_w: this.crop.sw, src_h: this.crop.sh, dlss5: settings.dlss5, framegen: settings.framegen },
+        config: { type: 'config', src_w: this.crop.sw, src_h: this.crop.sh, disp_w: this.crop.Cw, disp_h: this.crop.Ch,
+                  dlss5: settings.dlss5, vsr: settings.vsr, framegen: settings.framegen },
       });
     }
 
@@ -371,6 +382,7 @@
     destroy() {
       this.running = false;
       clearInterval(this._pingTimer);
+      clearTimeout(this._dispDebounce);
       if (this._vfcHandle && this.video.cancelVideoFrameCallback) this.video.cancelVideoFrameCallback(this._vfcHandle);
       if (this._rafHandle) cancelAnimationFrame(this._rafHandle);
       try { this.port.postMessage({ type: 'stop' }); this.port.disconnect(); } catch (e) { /* already gone */ }
@@ -493,6 +505,20 @@
     container.appendChild(row);
   }
 
+  function selectRow(container, label, key, obj, options) {
+    const row = document.createElement('div'); row.className = 'nsyt-row';
+    const lab = document.createElement('span'); lab.className = 'nsyt-row-label'; lab.textContent = label;
+    const select = document.createElement('select');
+    options.forEach(([value, text]) => {
+      const opt = document.createElement('option'); opt.value = String(value); opt.textContent = text;
+      select.appendChild(opt);
+    });
+    select.value = String(obj[key]);
+    select.addEventListener('change', () => { obj[key] = parseInt(select.value, 10); persist(); });
+    row.appendChild(lab); row.appendChild(select);
+    container.appendChild(row);
+  }
+
   function checkboxRow(container, label, key, obj, onChange) {
     const row = document.createElement('label'); row.className = 'nsyt-row nsyt-row-check';
     const input = document.createElement('input'); input.type = 'checkbox'; input.checked = !!obj[key];
@@ -535,18 +561,24 @@
     const openMenus = [];
     const dlss5Menu = buildSettingsMenu('DLSS5', (menu) => {
       checkboxRow(menu, 'Включено', 'enabled', settings.dlss5, () => dlss5Menu.setOn(settings.dlss5.enabled));
-      sliderRow(menu, 'Разрешение', 'scale', settings.dlss5, 0.25, 1.0, 0.05);
+      selectRow(menu, 'Стиль', 'style', settings.dlss5, [[0, 'Дефолтный'], [1, 'Нейтральный'], [2, 'Кинематографичный']]);
       sliderRow(menu, 'Интенсивность', 'intensity', settings.dlss5, 0, 2, 0.05);
       sliderRow(menu, 'Локальный тон', 'local_tone', settings.dlss5, 0, 2, 0.05);
       sliderRow(menu, 'Локальная структура', 'local_structure', settings.dlss5, 0, 2, 0.05);
       sliderRow(menu, 'Структура кожи', 'skin_structure', settings.dlss5, -1, 1, 0.05);
       checkboxRow(menu, 'Авто-маска', 'auto_mask', settings.dlss5);
     }, openMenus);
+    const vsrMenu = buildSettingsMenu('VSR', (menu) => {
+      checkboxRow(menu, 'Включено', 'enabled', settings.vsr, () => vsrMenu.setOn(settings.vsr.enabled));
+      sliderRow(menu, 'Разрешение', 'scale', settings.vsr, 0.25, 1.0, 0.05);
+      sliderRow(menu, 'Детализация', 'quality', settings.vsr, 1, 4, 1);
+    }, openMenus);
     const fgMenu = buildSettingsMenu('Кадры', (menu) => {
       checkboxRow(menu, 'Включено', 'enabled', settings.framegen, () => fgMenu.setOn(settings.framegen.enabled));
       sliderRow(menu, 'Множитель', 'multiplier', settings.framegen, 2, 4, 1);
     }, openMenus);
     dlss5Menu.setOn(settings.dlss5.enabled);
+    vsrMenu.setOn(settings.vsr.enabled);
     fgMenu.setOn(settings.framegen.enabled);
 
     const applyBtn = document.createElement('button'); applyBtn.className = 'nsyt-apply'; applyBtn.innerHTML = ICON_CHECK; applyBtn.title = 'Применить';
@@ -557,6 +589,7 @@
     overlay.addEventListener('pointerdown', (e) => { if (!controlsWrap.contains(e.target)) openMenus.forEach((fn) => fn()); }, true);
 
     controlsWrap.appendChild(dlss5Menu.wrap);
+    controlsWrap.appendChild(vsrMenu.wrap);
     controlsWrap.appendChild(fgMenu.wrap);
     controlsWrap.appendChild(applyBtn);
     controlsWrap.appendChild(cancelBtn);

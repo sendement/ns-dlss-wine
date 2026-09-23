@@ -100,3 +100,7 @@
 .nsyt-row input[type="range"] { flex: 1 1 90px; min-width: 60px; }
 .nsyt-row-check { cursor: pointer; }
 .nsyt-row-check input { margin: 0; }
+.nsyt-row select {
+  flex: 1 1 90px; min-width: 60px; background: #333; color: #eee; border: none; border-radius: 6px;
+  padding: 3px 6px; font: inherit; cursor: pointer;
+}

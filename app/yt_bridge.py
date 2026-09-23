@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: MIT
 """Local WebSocket bridge for the ns-dlss-yt browser extension (extension/): the content script sends video frames (already cropped to aspect ratio in the
-page, cheap DOM/canvas work) and receives back the result of the SAME pipeline the live screen filter uses - DLSS5 (worker.py, rendering at a scaled-down
-size and returning it AT THAT size, no internal reconstruction) -> RTX VSR (upscales back to the crop's native size, only when DLSS5 rendered smaller) ->
-frame generation (app/framegen) - each stage optional/skippable, matching the extension's two player buttons (VSR itself has no button - it's purely the
-glue between DLSS5's render size and the crop's native size, automatic).
+page, cheap DOM/canvas work) and receives back the result of the SAME pipeline the live screen filter uses - VSR downscale (an independent stage, its own
+button/settings, not tied to DLSS5) -> DLSS5 (worker.py, processes whatever size it's handed, 1:1, no internal reconstruction) -> RTX VSR upscale (back to
+the on-screen DISPLAY size, not the crop's native size - see disp_w/disp_h below) -> frame generation (app/framegen). Each stage is independently
+optional/skippable, matching the extension's three player buttons.
 DLSS5's own internal reconstruction (full_w/full_h) was tried first and dropped: confirmed via a raw frame dump that it corrupts its output (a sheared,
-mostly-black image) for any non-1:1 work/full ratio, not just extreme ones - so DLSS5 here always renders and returns at its own work size.
+mostly-black image) for any non-1:1 work/full ratio, not just extreme ones - so DLSS5 here always renders and returns at its own work size, and a real VSR
+stage (also used by live_filter.py) does the actual up/downscale.
 
-One WebSocket connection = one browser tab's pipeline (its own Worker/framegen instances, created lazily and torn down on disconnect or on a size change).
-Wire protocol:
+One WebSocket connection = one browser tab's pipeline (its own Worker/VSR/framegen instances, created lazily and torn down on disconnect or on a size
+change). Wire protocol:
 
-  text (JSON) "config"   -> reconfigure this connection's pipeline; replied to with {"type":"config_ack","ok":bool,"error":str|null}
+  text (JSON) "config"   -> {type, src_w, src_h, disp_w, disp_h, dlss5: {...}, vsr: {...}, framegen: {...}} - src_w/src_h is the crop's native video-pixel
+                             size (what VSR downscales FROM, and DLSS5 processes at, once downscaled); disp_w/disp_h is the on-screen CSS pixel size (what
+                             VSR upscales back TO) - reconfigures this connection's pipeline, replied to with {"type":"config_ack","ok":bool,"error":str|null}
   binary frame            -> one source frame: b"SRC1" + <IIff  (seq:u32, unused:u32, w:u32, h:u32) + RGBA8 pixels (w*h*4 bytes)
   binary reply/replies    -> b"OUT1" + <6I f  (seq:u32 matches the source frame, idx:u32, count:u32, w:u32, h:u32, flags:u32 bit0=BGRA order,
                              pts_ms:f32 - ms from now to display, 0 for the last/real frame of the set) + pixels
@@ -47,13 +50,16 @@ def log(*a):
 
 
 class Pipeline:
-    """One tab's processing chain: DLSS5 (renders at a scaled-down size, returns it at that same size - no internal reconstruction, see the module
-    docstring) -> RTX VSR (upscales that back to the crop's native size, only when DLSS5 actually rendered smaller) -> frame generation. Any stage may be
-    off/a no-op; the frame just flows through to the next one unchanged. Torn down and rebuilt whenever the source size or a stage's own size-affecting
-    settings change (mirrors live_filter.py's `_ensure_fg`/`Worker.reconfigure`)."""
+    """One tab's processing chain: VSR downscale (an ordinary resize, if enabled - a real, independent stage now, not tied to DLSS5) -> DLSS5 (processes
+    at whatever size it's handed, 1:1, no internal reconstruction - see the module docstring) -> RTX VSR upscale (back to the on-screen display size,
+    only when the frame is actually smaller than that) -> frame generation. Any stage may be off/a no-op; the frame just flows through to the next one
+    unchanged. Torn down and rebuilt whenever the source size or a stage's own size-affecting settings change (mirrors live_filter.py's
+    `_ensure_fg`/`Worker.reconfigure`)."""
 
     def __init__(self):
         self.src_w = self.src_h = 0
+        self.disp_w = self.disp_h = 0
+        self.work_w = self.work_h = 0
         self.cfg = {}
         self.worker = None
         self.worker_key = None
@@ -62,57 +68,63 @@ class Pipeline:
         self.fg = None
         self.fg_key = None
 
-    def configure(self, cfg, src_w, src_h):
+    def configure(self, cfg, src_w, src_h, disp_w=0, disp_h=0):
         self.cfg = cfg
         self.src_w, self.src_h = src_w, src_h
-        log(f"configure: src={src_w}x{src_h} dlss5={cfg.get('dlss5')} framegen={cfg.get('framegen')}")
+        self.disp_w, self.disp_h = disp_w or src_w, disp_h or src_h
+        log(f"configure: src={src_w}x{src_h} disp={self.disp_w}x{self.disp_h} dlss5={cfg.get('dlss5')} vsr={cfg.get('vsr')} framegen={cfg.get('framegen')}")
+
+        v = cfg.get("vsr") or {}
+        vsr_on = bool(v.get("enabled"))
+        if vsr_on:
+            # wh is derived from ww via the crop's own aspect ratio rather than floored independently, so the work rectangle stays proportional to the
+            # crop (VSR's DLPack path needs 8-aligned rows internally - see hosts/vsr_native_host.py - handled there, not a concern for this ratio math).
+            scale = max(0.1, min(1.0, float(v.get("scale", 0.5))))
+            self.work_w = max(2, int(src_w * scale) & ~1)
+            self.work_h = max(2, int(round(self.work_w * src_h / src_w)) & ~1)
+        else:
+            self.work_w, self.work_h = src_w, src_h   # no downscale - DLSS5 (if on) processes at the crop's native resolution
+
         d = cfg.get("dlss5") or {}
         if d.get("enabled"):
-            # Render at `scale` of the cropped size and return it AT THAT size - DLSS5's own internal reconstruction was dropped (module docstring); a
-            # separate RTX VSR stage below does the actual upscale back to src_w/src_h. wh is derived from ww via the crop's own aspect ratio rather than
-            # floored independently, so the work rectangle stays proportional to the crop (VSR itself only cares that it's given a real image to upscale).
-            scale = max(0.1, min(1.0, float(d.get("scale", 0.5))))
-            ww = max(2, int(src_w * scale) & ~1)
-            wh = max(2, int(round(ww * src_h / src_w)) & ~1)
             params = DlssParams(style=int(d.get("style", 1)), auto_mask=int(d.get("auto_mask", 0)),
                                 ui_correction=int(d.get("ui_correction", 0)), intensity=float(d.get("intensity", 1.0)),
                                 local_tone=float(d.get("local_tone", 1.0)), local_structure=float(d.get("local_structure", 1.0)),
                                 skin_structure=float(d.get("skin_structure", -1.0)))
-            key = (ww, wh)
+            key = (self.work_w, self.work_h)
             if self.worker is None or self.worker_key != key:
                 if self.worker is not None:
                     self.worker.close()
-                self.worker = Worker(ww, wh, params=params, max_w=ww, max_h=wh)
+                self.worker = Worker(self.work_w, self.work_h, params=params, max_w=self.work_w, max_h=self.work_h)
                 self.worker_key = key
             else:
-                self.worker.reconfigure(ww, wh, params=params)
-            if (ww, wh) != (src_w, src_h):
-                if self.vsr is None:
-                    self.vsr = UPSCALER_REGISTRY["rtx_vsr"]()
-                self.vsr.configure(ww, wh, src_w, src_h, quality=4)
-                self.vsr_key = (ww, wh, src_w, src_h)
-            elif self.vsr is not None:
-                self.vsr.close()
-                self.vsr = self.vsr_key = None
-        else:
-            if self.worker is not None:
-                self.worker.close()
-                self.worker = self.worker_key = None
-            if self.vsr is not None:
-                self.vsr.close()
-                self.vsr = self.vsr_key = None
+                self.worker.reconfigure(self.work_w, self.work_h, params=params)
+        elif self.worker is not None:
+            self.worker.close()
+            self.worker = self.worker_key = None
+
+        if vsr_on and (self.work_w, self.work_h) != (self.disp_w, self.disp_h):
+            if self.vsr is None:
+                self.vsr = UPSCALER_REGISTRY["rtx_vsr"]()
+            quality = max(1, min(4, int(v.get("quality", 4))))
+            self.vsr.configure(self.work_w, self.work_h, self.disp_w, self.disp_h, quality=quality)
+            self.vsr_key = (self.work_w, self.work_h, self.disp_w, self.disp_h, quality)
+        elif self.vsr is not None:
+            self.vsr.close()
+            self.vsr = self.vsr_key = None
 
         f = cfg.get("framegen") or {}
         if f.get("enabled"):
             method = f.get("method", "dlssg")
             multiplier = max(2, min(4, int(f.get("multiplier", 2))))
-            key = (method, multiplier, src_w, src_h)
+            fg_w, fg_h = (self.disp_w, self.disp_h) if self.vsr is not None else (self.work_w, self.work_h)
+            key = (method, multiplier, fg_w, fg_h)
             if self.fg is None or self.fg_key != key:
                 if self.fg is not None:
                     self.fg.close()
                 if method not in FRAMEGEN_REGISTRY:
                     raise ValueError(f"unknown frame generation method {method!r}")
-                self.fg = FRAMEGEN_REGISTRY[method](src_w, src_h, FrameGenSettings(method=method, multiplier=multiplier))
+                self.fg = FRAMEGEN_REGISTRY[method](fg_w, fg_h, FrameGenSettings(method=method, multiplier=multiplier))
                 self.fg_key = key
         elif self.fg is not None:
             self.fg.close()
@@ -125,15 +137,14 @@ class Pipeline:
         """One source frame -> list of (rgba_or_bgra, is_bgra, pts_ms) to send, in display order. Frame generation (if on) yields the generated frames first
         (their true temporal position is BEFORE this real frame, relative to the previous one) followed by this real frame, pts_ms relative to "now"."""
         frame = rgba
+        if (frame.shape[1], frame.shape[0]) != (self.work_w, self.work_h):
+            frame = np.asarray(Image.fromarray(frame, "RGBA").resize((self.work_w, self.work_h), Image.BILINEAR))
         if self.worker is not None:
-            if (frame.shape[1], frame.shape[0]) != (self.worker.w, self.worker.h):
-                # the client sends the full-size cropped frame; DLSS5 wants it already at its own (scaled-down) work size
-                frame = np.asarray(Image.fromarray(frame, "RGBA").resize((self.worker.w, self.worker.h), Image.BILINEAR))
             out = self.worker.process(frame)
             if out is not None:
                 frame = out   # None = still priming (first frame(s)) - keep feeding the pre-DLSS5 frame downstream rather than stall the pipeline
-            if self.vsr is not None:
-                frame = self.vsr.upscale(frame)   # DLSS5 returns its own (smaller) work size now - VSR does the actual upscale back to src_w/src_h
+        if self.vsr is not None:
+            frame = self.vsr.upscale(frame)
         if self.fg is None:
             return [(frame, False, 0.0)]
         gens = self.fg.submit(frame, uniform_timestamps(self.fg.cfg.multiplier) if self.fg.supports_timestamps else None)
@@ -166,7 +177,8 @@ async def handle(ws):
                     continue
                 if m.get("type") == "config":
                     try:
-                        await asyncio.to_thread(pipe.configure, m, int(m["src_w"]), int(m["src_h"]))
+                        await asyncio.to_thread(pipe.configure, m, int(m["src_w"]), int(m["src_h"]),
+                                                 int(m.get("disp_w") or 0), int(m.get("disp_h") or 0))
                         await ws.send(json.dumps({"type": "config_ack", "ok": True}))
                     except Exception as exc:  # noqa: BLE001
                         log("config failed:", exc)

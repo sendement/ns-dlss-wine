@@ -1,11 +1,14 @@
-# ns-dlss-yt — DLSS5 / frame generation for YouTube
+# ns-dlss-yt — DLSS5 / VSR / frame generation for YouTube
 
 A browser extension (Chromium/Vivaldi, MV3) that crops the video to the player's aspect ratio, then optionally runs it through **DLSS5** (neural
-reconstruction, its own internal upscale) and/or **frame generation** — the same backends the live screen filter uses (`app/worker.py`, `app/framegen/`),
-reached through a small local WebSocket bridge (`app/yt_bridge.py`). See `docs/worker-protocol.md` and the bridge's own docstring for the wire protocol.
+reconstruction/denoise), **RTX VSR** (up/downscale) and/or **frame generation** — the same backends the live screen filter uses (`app/worker.py`,
+`app/upscalers/`, `app/framegen/`), reached through a small local WebSocket bridge (`app/yt_bridge.py`). See `docs/worker-protocol.md` and the bridge's
+own docstring for the wire protocol.
 
-Pipeline: crop (in the page, free) → DLSS5 (own internal upscale) → frame generation. Either stage is skippable from its own menu; the frame just flows
-through unchanged when off.
+Pipeline: crop (in the page, free) → VSR downscale (own menu, an independent resize step - "Разрешение") → DLSS5 (processes whatever size it's handed,
+1:1, no internal scaling of its own) → VSR upscale (back to the actual on-screen size, not the crop's native resolution) → frame generation. Any stage
+is skippable from its own menu; the frame just flows through unchanged when off. DLSS5's own internal reconstruction was tried and dropped - it
+corrupted its output for any non-1:1 ratio (see `app/yt_bridge.py`'s docstring) - VSR does the real up/downscale instead.
 
 ## Run it
 
@@ -18,12 +21,14 @@ through unchanged when off.
 2. Load the extension: `vivaldi://extensions` (or `chrome://extensions`) → enable *Developer mode* → *Load unpacked* → select this `extension/` folder.
 3. Open a YouTube video, go fullscreen, click the new button in the player controls (top-right). An overlay appears over the video:
    - drag it to choose which part of the frame gets kept (only shown when the video's own aspect ratio doesn't already match the player);
-   - the **DLSS5** and **Кадры** pill buttons open a menu each - a checkbox to enable that stage plus its sliders;
-   - **✓** applies the crop and starts the pipeline with whatever DLSS5/Кадры settings are set at that moment; **✕** cancels.
-4. To change DLSS5/frame-generation settings afterwards, click the button again (this turns the pipeline off), then once more to reopen the same overlay,
-   adjust, and confirm. This mirrors the crop-adjustment step exactly - settings are only ever sent to the bridge once, on confirm, not while you're
-   dragging a slider: the DLSS5 backend rebuilds its own worker process on a resolution change (seconds, not milliseconds), so live-updating on every
-   slider tick would make the pipeline spend most of its time restarting instead of processing frames.
+   - the **DLSS5**, **VSR** and **Кадры** pill buttons open a menu each - a checkbox to enable that stage plus its sliders (DLSS5: style preset
+     Дефолтный/Нейтральный/Кинематографичный plus intensity/tone/structure sliders; VSR: downscale "Разрешение" and "Детализация" quality);
+   - **✓** applies the crop and starts the pipeline with whatever settings are set at that moment; **✕** cancels.
+4. To change settings afterwards, click the button again (this turns the pipeline off), then once more to reopen the same overlay, adjust, and confirm.
+   This mirrors the crop-adjustment step exactly - settings are only ever sent to the bridge once, on confirm, not while you're dragging a slider: the
+   DLSS5/VSR backends rebuild their own worker process on a size change (seconds, not milliseconds), so live-updating on every slider tick would make
+   the pipeline spend most of its time restarting instead of processing frames. Resizing the player window/tab (theater mode, fullscreen) alone doesn't
+   need the overlay - VSR's upscale target follows the on-screen size automatically, debounced so a resize drag only reconfigures once it settles.
 
 Settings (and the crop position, for videos with a matching aspect ratio, for the rest of the session) persist via `chrome.storage.local`.
 
