@@ -29,9 +29,12 @@ import asyncio
 import concurrent.futures
 import io
 import json
+import mmap
 import os
 import struct
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -52,13 +55,104 @@ OUT_HDR = struct.Struct("<4sIIIIIIf")   # magic, seq, idx, count, w, h, flags (r
 
 DEFAULT_PORT = int(os.environ.get("NS_YT_BRIDGE_PORT", "8765"))
 JPEG_QUALITY = int(os.environ.get("NS_YT_JPEG_QUALITY", "85"))
+_JPEG_MAX_W, _JPEG_MAX_H = 3840, 2160   # GPU JPEG encoder buffer ceiling - generous (larger than any realistic disp_w/disp_h), no per-size restart needed
 
 
-def _encode_jpeg(frame: np.ndarray, is_bgra: bool) -> bytes:
-    rgb = frame[..., [2, 1, 0]] if is_bgra else frame[..., :3]   # JPEG has no alpha channel and no BGR order - normalize once, here
+def _to_rgb(frame: np.ndarray, is_bgra: bool) -> np.ndarray:
+    return frame[..., [2, 1, 0]] if is_bgra else frame[..., :3]   # JPEG has no alpha channel and no BGR order - normalize once, here
+
+
+def _encode_jpeg_cpu(rgb: np.ndarray) -> bytes:
     buf = io.BytesIO()
     Image.fromarray(rgb, "RGB").save(buf, format="JPEG", quality=JPEG_QUALITY)
     return buf.getvalue()
+
+
+class GpuJpegEncoder:
+    """Persistent GPU JPEG encode host (hosts/jpeg_encode_host.py, torch/torchvision's nvjpeg binding, runtime/venv-jpeg) - see that file's docstring for
+    the wire protocol and why it's a separate process/venv. Benchmarked ~2.8x faster end-to-end than PIL/libjpeg-turbo (already the fast CPU codec on
+    this system) for a 2154x1152 frame. Calls are serialized by `_lock` (the mmap req/ack protocol isn't concurrency-safe), but a GPU round trip is only
+    ~5-6ms - unlike the CPU path, there's no need to hide latency behind a worker pool here."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._dir = tempfile.mkdtemp(prefix="ns-yt-jpeg-")
+        self._paths = [os.path.join(self._dir, n) for n in ("in.bin", "out.bin", "ctl.bin")]
+        ceiling = _JPEG_MAX_W * _JPEG_MAX_H * 3
+        for p, size in zip(self._paths, (ceiling, ceiling, 64)):
+            with open(p, "wb") as f:
+                f.truncate(size)
+        self._proc = subprocess.Popen(
+            [nspaths.VENV_JPEG_PYTHON, os.path.join(nspaths.ROOT, "hosts", "jpeg_encode_host.py"), str(_JPEG_MAX_W), str(_JPEG_MAX_H), *self._paths],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=None if os.environ.get("NS_JPEG_LOG") else subprocess.DEVNULL)
+        self._files = [open(p, "r+b") for p in self._paths]
+        self._maps = [mmap.mmap(f.fileno(), 0) for f in self._files]
+        self._in, self._out, self._ctl = self._maps
+        self._seq = 0
+        t0 = time.monotonic()
+        while self._u32(0) == 0:
+            if self._proc.poll() is not None or time.monotonic() - t0 > 30:
+                self.close()
+                raise RuntimeError("jpeg_encode_host failed to start (NS_JPEG_LOG=1 shows why)")
+            time.sleep(0.02)
+        if self._u32(0) != 1:
+            self.close()
+            raise RuntimeError("jpeg_encode_host reported an error while starting (NS_JPEG_LOG=1)")
+
+    def _u32(self, off):
+        return struct.unpack_from("<I", self._ctl, off)[0]
+
+    def encode(self, rgb: np.ndarray, quality: int) -> bytes:
+        h, w = rgb.shape[:2]
+        if w > _JPEG_MAX_W or h > _JPEG_MAX_H:
+            raise ValueError(f"{w}x{h} exceeds the GPU JPEG encoder's {_JPEG_MAX_W}x{_JPEG_MAX_H} ceiling")
+        with self._lock:
+            n = w * h * 3
+            np.frombuffer(self._in, dtype=np.uint8, count=n).reshape(h, w, 3)[:] = rgb
+            struct.pack_into("<III", self._ctl, 24, w, h, quality)   # w(24) h(28) quality(32)
+            seq = self._seq + 1
+            struct.pack_into("<I", self._ctl, 4, seq)
+            t0 = time.monotonic()
+            while self._u32(8) != seq:
+                if self._proc.poll() is not None or time.monotonic() - t0 > 5:
+                    raise RuntimeError("jpeg_encode_host stopped answering")
+                time.sleep(0.0002)
+            self._seq = seq
+            if not self._u32(12):
+                raise RuntimeError("GPU JPEG encode failed (NS_JPEG_LOG=1 shows why)")
+            return bytes(self._out[:self._u32(20)])
+
+    def close(self):
+        proc = getattr(self, "_proc", None)
+        if proc is not None:
+            try:
+                if self._maps:
+                    struct.pack_into("<I", self._ctl, 16, 1)
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+                proc.wait()
+            self._proc = None
+        for m in getattr(self, "_maps", []):
+            try:
+                m.close()
+            except Exception:
+                pass
+        for f in getattr(self, "_files", []):
+            f.close()
+        self._maps, self._files = [], []
+        d = getattr(self, "_dir", None)
+        if d:
+            for name in os.listdir(d):
+                try:
+                    os.unlink(os.path.join(d, name))
+                except OSError:
+                    pass
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+            self._dir = None
 
 
 def log(*a):
@@ -135,6 +229,9 @@ class Pipeline:
         # submission, ~50-90ms - if done inline on _fg_run, that directly delays it from picking up the NEXT frame, capping throughput below what
         # dlss5/vsr/framegen's own combined cost would otherwise allow. A 2-worker pool lets one submission's pair encode while the next is processed.
         self._encode_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="ns-yt-encode")
+        self._gpu_jpeg = None            # built lazily, off the event loop (CUDA init takes real time) - see _ensure_gpu_jpeg()
+        self._gpu_jpeg_failed = False    # sticky: don't retry a slow failed GPU init on every frame once it's known not to work
+        self._gpu_jpeg_lock = threading.Lock()
         self._threads = [threading.Thread(target=self._dlss_run, daemon=True), threading.Thread(target=self._vsr_run, daemon=True),
                           threading.Thread(target=self._fg_run, daemon=True)]
         for th in self._threads:
@@ -339,9 +436,38 @@ class Pipeline:
     def _encode_and_emit(self, seq, idx, count, out_frame, is_bgra, pts_ms):
         fh, fw = out_frame.shape[:2]
         t0 = time.perf_counter()
-        jpeg_bytes = _encode_jpeg(out_frame, is_bgra)
+        jpeg_bytes = self._encode_frame(out_frame, is_bgra)
         self._record("jpeg", (time.perf_counter() - t0) * 1000)
         self._loop.call_soon_threadsafe(self._on_output, seq, idx, count, jpeg_bytes, fw, fh, pts_ms)
+
+    def _encode_frame(self, out_frame: np.ndarray, is_bgra: bool) -> bytes:
+        rgb = _to_rgb(out_frame, is_bgra)
+        if not self._gpu_jpeg_failed:
+            enc = self._ensure_gpu_jpeg()
+            if enc is not None:
+                try:
+                    return enc.encode(rgb, JPEG_QUALITY)
+                except Exception:  # noqa: BLE001
+                    log("GPU JPEG encode failed, falling back to CPU for the rest of this connection:\n" + traceback.format_exc())
+                    self._gpu_jpeg_failed = True
+        return _encode_jpeg_cpu(rgb)
+
+    def _ensure_gpu_jpeg(self):
+        if self._gpu_jpeg is not None or self._gpu_jpeg_failed:
+            return self._gpu_jpeg
+        with self._gpu_jpeg_lock:
+            if self._gpu_jpeg is not None or self._gpu_jpeg_failed:
+                return self._gpu_jpeg
+            if not os.path.exists(nspaths.VENV_JPEG_PYTHON):
+                self._gpu_jpeg_failed = True   # not installed - runtime/venv-jpeg, see hosts/jpeg_encode_host.py's docstring - silently use CPU
+                return None
+            try:
+                self._gpu_jpeg = GpuJpegEncoder()
+                log("GPU JPEG encoder ready")
+            except Exception:  # noqa: BLE001
+                log("GPU JPEG encoder unavailable, using CPU:\n" + traceback.format_exc())
+                self._gpu_jpeg_failed = True
+            return self._gpu_jpeg
 
     def close(self):
         self._stop.set()
@@ -357,6 +483,8 @@ class Pipeline:
             self.vsr.close()
         if self.fg is not None:
             self.fg.close()
+        if self._gpu_jpeg is not None:
+            self._gpu_jpeg.close()
 
 
 async def handle(ws):
