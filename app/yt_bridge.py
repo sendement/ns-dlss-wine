@@ -15,13 +15,18 @@ change). Wire protocol:
                              size (what VSR downscales FROM, and DLSS5 processes at, once downscaled); disp_w/disp_h is the on-screen CSS pixel size (what
                              VSR upscales back TO) - reconfigures this connection's pipeline, replied to with {"type":"config_ack","ok":bool,"error":str|null}
   binary frame            -> one source frame: b"SRC1" + <IIff  (seq:u32, unused:u32, w:u32, h:u32) + RGBA8 pixels (w*h*4 bytes)
-  binary reply/replies    -> b"OUT1" + <6I f  (seq:u32 matches the source frame, idx:u32, count:u32, w:u32, h:u32, flags:u32 bit0=BGRA order,
-                             pts_ms:f32 - ms from now to display, 0 for the last/real frame of the set) + pixels
+  binary reply/replies    -> b"OUT1" + <6I f  (seq:u32 matches the source frame, idx:u32, count:u32, w:u32, h:u32, flags:u32 reserved, pts_ms:f32 - ms
+                             from now to display, 0 for the last/real frame of the set) + a JPEG-encoded image (the rest of the message) - raw RGBA output
+                             frames turned out to dominate round-trip time even with WebSocket compression off (several MB/frame, doubled by frame
+                             generation); JPEG cuts that by ~8-15x for photographic content at negligible visible cost, and both PIL (encode) and the
+                             browser's own decoder (createImageBitmap, hardware-accelerated) are far faster at it than generic deflate ever was on raw
+                             pixels. Always RGB - no BGRA flag needed, JPEG has no alpha channel and the encode step normalizes color order itself.
 
 Run: python3 app/yt_bridge.py [--port 8765]
 """
 import argparse
 import asyncio
+import io
 import json
 import os
 import struct
@@ -42,9 +47,17 @@ from framegen import REGISTRY as FRAMEGEN_REGISTRY, FrameGenSettings, uniform_ti
 from upscalers import REGISTRY as UPSCALER_REGISTRY  # noqa: E402
 
 SRC_HDR = struct.Struct("<4sIIII")      # magic, seq, unused, w, h
-OUT_HDR = struct.Struct("<4sIIIIIIf")   # magic, seq, idx, count, w, h, flags (bit0 = BGRA order), pts_ms
+OUT_HDR = struct.Struct("<4sIIIIIIf")   # magic, seq, idx, count, w, h, flags (reserved, always 0), pts_ms
 
 DEFAULT_PORT = int(os.environ.get("NS_YT_BRIDGE_PORT", "8765"))
+JPEG_QUALITY = int(os.environ.get("NS_YT_JPEG_QUALITY", "85"))
+
+
+def _encode_jpeg(frame: np.ndarray, is_bgra: bool) -> bytes:
+    rgb = frame[..., [2, 1, 0]] if is_bgra else frame[..., :3]   # JPEG has no alpha channel and no BGR order - normalize once, here
+    buf = io.BytesIO()
+    Image.fromarray(rgb, "RGB").save(buf, format="JPEG", quality=JPEG_QUALITY)
+    return buf.getvalue()
 
 
 def log(*a):
@@ -311,7 +324,9 @@ class Pipeline:
             self._fps_n = 0
             self._fps_t0 = time.perf_counter()
         for idx, (out_frame, is_bgra, pts_ms) in enumerate(outs):
-            self._loop.call_soon_threadsafe(self._on_output, seq, idx, count, out_frame, is_bgra, pts_ms)
+            fh, fw = out_frame.shape[:2]
+            jpeg_bytes = _encode_jpeg(out_frame, is_bgra)
+            self._loop.call_soon_threadsafe(self._on_output, seq, idx, count, jpeg_bytes, fw, fh, pts_ms)
 
     def close(self):
         self._stop.set()
@@ -331,11 +346,12 @@ async def handle(ws):
     loop = asyncio.get_running_loop()
     out_q: "asyncio.Queue" = asyncio.Queue(maxsize=16)
 
-    def on_output(seq, idx, count, frame, is_bgra, pts_ms):
+    def on_output(seq, idx, count, jpeg_bytes, fw, fh, pts_ms):
         # Called via call_soon_threadsafe from a pipeline stage thread - never blocks (put_nowait; the queue is generously sized and drained continuously
-        # by the sender below, so it only fills up if the WebSocket send itself is backed up, not from pipeline speed).
+        # by the sender below, so it only fills up if the WebSocket send itself is backed up, not from pipeline speed). jpeg_bytes is already fully
+        # encoded (done in _fg_step, off the event loop) - sender() below just ships it, no CPU work on the event loop itself.
         try:
-            out_q.put_nowait((seq, idx, count, frame, is_bgra, pts_ms))
+            out_q.put_nowait((seq, idx, count, jpeg_bytes, fw, fh, pts_ms))
         except asyncio.QueueFull:
             pass
 
@@ -343,11 +359,9 @@ async def handle(ws):
 
     async def sender():
         while True:
-            seq, idx, count, frame, is_bgra, pts_ms = await out_q.get()
-            fh, fw = frame.shape[:2]
-            payload = frame.tobytes()
-            header = OUT_HDR.pack(b"OUT1", seq, idx, count, fw, fh, 1 if is_bgra else 0, pts_ms)
-            await ws.send(header + payload)
+            seq, idx, count, jpeg_bytes, fw, fh, pts_ms = await out_q.get()
+            header = OUT_HDR.pack(b"OUT1", seq, idx, count, fw, fh, 0, pts_ms)
+            await ws.send(header + jpeg_bytes)
 
     sender_task = asyncio.create_task(sender())
     try:
