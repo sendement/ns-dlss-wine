@@ -436,14 +436,14 @@ class Pipeline:
             self._fps_n = 0
             self._fps_t0 = time.perf_counter()
         for idx, (out_frame, is_bgra, pts_ms) in enumerate(outs):
-            self._encode_pool.submit(self._encode_and_emit, seq, idx, count, out_frame, is_bgra, pts_ms)
+            self._encode_pool.submit(self._encode_and_emit, seq, idx, count, out_frame, is_bgra, pts_ms, t_submit)
 
-    def _encode_and_emit(self, seq, idx, count, out_frame, is_bgra, pts_ms):
+    def _encode_and_emit(self, seq, idx, count, out_frame, is_bgra, pts_ms, t_submit):
         fh, fw = out_frame.shape[:2]
         t0 = time.perf_counter()
         jpeg_bytes = self._encode_frame(out_frame, is_bgra)
         self._record("jpeg", (time.perf_counter() - t0) * 1000)
-        self._loop.call_soon_threadsafe(self._on_output, seq, idx, count, jpeg_bytes, fw, fh, pts_ms)
+        self._loop.call_soon_threadsafe(self._on_output, seq, idx, count, jpeg_bytes, fw, fh, pts_ms, t_submit)
 
     def _encode_frame(self, out_frame: np.ndarray, is_bgra: bool) -> bytes:
         rgb = _to_rgb(out_frame, is_bgra)
@@ -511,22 +511,33 @@ async def handle(ws):
     loop = asyncio.get_running_loop()
     out_q: "asyncio.Queue" = asyncio.Queue(maxsize=16)
 
-    def on_output(seq, idx, count, jpeg_bytes, fw, fh, pts_ms):
+    def on_output(seq, idx, count, jpeg_bytes, fw, fh, pts_ms, t_submit):
         # Called via call_soon_threadsafe from a pipeline stage thread - never blocks (put_nowait; the queue is generously sized and drained continuously
         # by the sender below, so it only fills up if the WebSocket send itself is backed up, not from pipeline speed). jpeg_bytes is already fully
         # encoded (done in _fg_step, off the event loop) - sender() below just ships it, no CPU work on the event loop itself.
         try:
-            out_q.put_nowait((seq, idx, count, jpeg_bytes, fw, fh, pts_ms))
+            out_q.put_nowait((seq, idx, count, jpeg_bytes, fw, fh, pts_ms, t_submit))
         except asyncio.QueueFull:
             pass
 
     pipe = Pipeline(loop, on_output)
+    last_full_log = 0.0
 
     async def sender():
+        nonlocal last_full_log
         while True:
-            seq, idx, count, jpeg_bytes, fw, fh, pts_ms = await out_q.get()
+            seq, idx, count, jpeg_bytes, fw, fh, pts_ms, t_submit = await out_q.get()
             header = OUT_HDR.pack(b"OUT1", seq, idx, count, fw, fh, 0, pts_ms)
+            t_before_send = time.perf_counter()
+            queued_ms = (t_before_send - t_submit) * 1000   # everything up to and including JPEG encode, before this frame even reaches ws.send()
             await ws.send(header + jpeg_bytes)
+            is_real = idx == count - 1
+            now = time.perf_counter()
+            if is_real and now - last_full_log > 3.0:
+                last_full_log = now
+                send_ms = (now - t_before_send) * 1000
+                log(f"full server latency (submit -> ws.send() done): {(now - t_submit) * 1000:.1f}ms "
+                    f"(pipeline+encode: {queued_ms:.1f}ms, send() call itself: {send_ms:.1f}ms) [{len(jpeg_bytes)} bytes]")
 
     sender_task = asyncio.create_task(sender())
     try:
