@@ -136,18 +136,26 @@ class Pipeline:
     def process(self, rgba: np.ndarray):
         """One source frame -> list of (rgba_or_bgra, is_bgra, pts_ms) to send, in display order. Frame generation (if on) yields the generated frames first
         (their true temporal position is BEFORE this real frame, relative to the previous one) followed by this real frame, pts_ms relative to "now"."""
+        t = {}
+        t0 = time.perf_counter()
         frame = rgba
         if (frame.shape[1], frame.shape[0]) != (self.work_w, self.work_h):
             frame = np.asarray(Image.fromarray(frame, "RGBA").resize((self.work_w, self.work_h), Image.BILINEAR))
+        t1 = time.perf_counter(); t["resize"] = (t1 - t0) * 1000
         if self.worker is not None:
             out = self.worker.process(frame)
             if out is not None:
                 frame = out   # None = still priming (first frame(s)) - keep feeding the pre-DLSS5 frame downstream rather than stall the pipeline
+        t2 = time.perf_counter(); t["dlss5"] = (t2 - t1) * 1000
         if self.vsr is not None:
             frame = self.vsr.upscale(frame)
+        t3 = time.perf_counter(); t["vsr"] = (t3 - t2) * 1000
         if self.fg is None:
+            self.last_timings = t
             return [(frame, False, 0.0)]
         gens = self.fg.submit(frame, uniform_timestamps(self.fg.cfg.multiplier) if self.fg.supports_timestamps else None)
+        t4 = time.perf_counter(); t["framegen"] = (t4 - t3) * 1000
+        self.last_timings = t
         bgra = getattr(self.fg, "output_bgra", False)
         interval_ms = 1000.0 / 30.0   # rough source frame interval estimate; the client repaces against its own rAF anyway
         n = self.fg.cfg.multiplier
@@ -222,10 +230,12 @@ async def handle(ws):
                 payload = frame.tobytes()
                 header = OUT_HDR.pack(b"OUT1", seq, idx, count, fw, fh, 1 if is_bgra else 0, pts_ms)
                 await ws.send(header + payload)
+            t = getattr(pipe, "last_timings", {})
+            breakdown = " ".join(f"{k}={v:.1f}ms" for k, v in t.items())
             if seq == 1:
-                log(f"first frame processed in {dt:.1f} ms -> {count} output(s)")
-            elif dt > 40:
-                log(f"slow frame: {dt:.1f} ms for {count} output(s)")
+                log(f"first frame processed in {dt:.1f} ms -> {count} output(s) [{breakdown}]")
+            elif dt > 40 or seq % 60 == 0:
+                log(f"{'slow frame' if dt > 40 else 'frame'} {seq}: {dt:.1f} ms total for {count} output(s) [{breakdown}]")
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
